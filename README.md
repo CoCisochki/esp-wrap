@@ -29,10 +29,10 @@ Protocol 50 (ESP) находится на одном уровне с TCP и UDP,
 - **Userspace Raw Socket:** Работает через сырой сокет `ip4:50` (`SOCK_RAW`, `IPPROTO_ESP`) без использования ядерных политик `ip xfrm` и без тяжелых демонов (StrongSwan, Libreswan).
 - **Zero-IKE:** Не открывает порты UDP 500 и 4500, устраняя главную причину блокировки классического IPsec со стороны DPI.
 - **Шифрование:** Симметричное блочное шифрование AES-GCM (RFC 4106) с аппаратным ускорением AES-NI и встроенной аутентификацией пакетов (AEAD ICV).
-- **Модель авторизации Reality:** Сервер использует статическую пару ключей X25519, а клиенты авторизуются по своим `UUID`. Клиенту для подключения требуются только `server_public_key` и личный `UUID`.
-- **Сессионные ключи:** Генерируются динамически при каждом рукопожатии через эллиптический обмен Диффи-Хеллмана (X25519 ECDH) и функцию деривации HKDF-SHA256.
+- **Модель авторизации Reality и Forward Secrecy:** Сервер использует статическую пару ключей X25519, а клиенты авторизуются по своим `UUID`. Полноценный Forward Secrecy достигается двухэтапным обменом Диффи-Хеллмана (StaticDH + EphemeralDH).
+- **Раздельные сессионные ключи (c2s / s2c):** Для исключения повтора Nonce потоки Клиент->Сервер и Сервер->Клиент шифруются независимыми ключами и солями, деривированными через стандартный HKDF-SHA256.
 - **Динамический пул адресов:** Сервер автоматически выделяет клиентам IP-адреса из подсети `10.99.0.0/16` в оперативной памяти и изолирует клиентов друг от друга (client-to-client isolation).
-- **Anti-Replay:** 64-битное скользящее битовое окно с защитой от повторов и синхронизацией сессий по временной метке старта клиента.
+- **Anti-Replay и Rekeying:** 64-битное скользящее окно защиты от повторов на обеих сторонах, защита от CPU-DoS через HMAC `mac1` до вызова криптографии и автоматический повторный хендшейк (Rekey) каждые 2 часа.
 - **Сетевой интерфейс:** Виртуальный адаптер `TUN` (`tun-esp0`) для передачи L3 IP-трафика и встроенный прокси-сервер SOCKS5 (`127.0.0.1:10951`).
 
 ---
@@ -111,11 +111,9 @@ sudo ./esp-server -c server.json -no-tun
 Скрипт `scripts/deploy_new_server.sh` компилирует бинарники, загружает их на сервер, генерирует ключи, настраивает `systemd` и выгружает готовые архивы для клиентов:
 
 ```bash
-# По SSH-ключу:
 ./scripts/deploy_new_server.sh 198.51.100.1
-
-# По SSH-паролю:
-./scripts/deploy_new_server.sh 198.51.100.1 "ВашПароль"
+# или с указанием пользователя:
+./scripts/deploy_new_server.sh 198.51.100.1 ubuntu
 ```
 
 Готовые клиентские пакеты сохраняются в каталоге `generated_clients/198.51.100.1/`.
@@ -218,10 +216,10 @@ Protocol 50 (ESP) operates at the same IP transport layer as TCP and UDP but lac
 - **Userspace Raw Sockets:** Operates on an `ip4:50` raw socket (`SOCK_RAW`, `IPPROTO_ESP`) without kernel `ip xfrm` state policies or heavy daemons (StrongSwan, Libreswan).
 - **Zero-IKE Design:** Avoids UDP ports 500 and 4500 entirely, bypassing IKE inspection and state tracking.
 - **Authenticated Encryption:** AES-GCM (RFC 4106) with hardware AES-NI acceleration and integrated ICV tag authentication.
-- **Reality Authorization Model:** The server maintains a static X25519 keypair, while clients authenticate using individual `UUID` values. Clients only need `server_public_key` and their `UUID`.
-- **Dynamic Session Keys:** Ephemeral session keys derived on every connection via X25519 ECDH and HKDF-SHA256.
+- **Reality Authorization Model & Forward Secrecy:** The server maintains a static X25519 keypair, while clients authenticate using individual `UUID` values. True Forward Secrecy is achieved via dual Diffie-Hellman exchanges (StaticDH + EphemeralDH).
+- **Directional Session Keys (c2s / s2c):** Eliminates nonce reuse by deriving strictly independent keys, salts, and IV bases for Client->Server and Server->Client flows using standard HKDF-SHA256.
 - **Dynamic IP Allocation:** In-memory `/16` subnet dynamic pool with client-to-client isolation enforced in userspace.
-- **Anti-Replay Mechanism:** 64-bit sliding window bitmap with start timestamp synchronization for clean client restarts.
+- **Anti-Replay Mechanism & Rekeying:** 64-bit sliding window bitmap on both endpoints, pre-ECDH CPU-DoS protection via HMAC `mac1`, and automatic rekeying every 2 hours.
 - **Network Interface:** Virtual `TUN` adapter (`tun-esp0`) and an integrated local SOCKS5 proxy (`127.0.0.1:10951`).
 
 ---
@@ -300,11 +298,9 @@ sudo ./esp-server -c server.json -no-tun
 Use `scripts/deploy_new_server.sh` to compile, provision, and configure the remote node:
 
 ```bash
-# Using SSH Key:
 ./scripts/deploy_new_server.sh 198.51.100.1
-
-# Using SSH Password:
-./scripts/deploy_new_server.sh 198.51.100.1 "YourPassword"
+# or specifying a custom user:
+./scripts/deploy_new_server.sh 198.51.100.1 ubuntu
 ```
 
 Client configuration bundles are saved to `generated_clients/198.51.100.1/`.

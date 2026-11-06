@@ -36,28 +36,33 @@ type Config struct {
 	TunCIDR    int           `json:"tun_cidr"`
 	TunMTU     int           `json:"tun_mtu"`
 	DisableTun bool          `json:"disable_tun,omitempty"`
-	Key        string        `json:"key,omitempty"`
-	PrivateKey string        `json:"private_key,omitempty"`
-	PublicKey  string        `json:"public_key,omitempty"`
+	PrivateKey string        `json:"private_key"`
+	PublicKey  string        `json:"public_key"`
 	Clients    []ClientEntry `json:"clients"`
 }
 
 type ClientEntry struct {
 	Name string `json:"name"`
-	UUID string `json:"uuid,omitempty"`
+	UUID string `json:"uuid"`
 }
 
 type ClientSession struct {
-	Name        string
-	UUID        string
-	UUIDBytes   [16]byte
-	SPI         uint32
+	Name              string
+	UUID              string
+	UUIDBytes         [16]byte
+	AuthSPI           uint32
+	Mac1Key           [32]byte
+	LastHandshakeNano int64
+	RateLimitMu       sync.Mutex
+
+	SessionSPIMu sync.RWMutex
+	SessionSPI   uint32
+	Cipher       *esp.SessionCipher
+	AntiReplay   *esp.AntiReplay
+
 	CurrentIP   atomic.Pointer[net.IP]
 	CurrentIP32 atomic.Uint32
-	CipherMu    sync.RWMutex
-	Cipher      *esp.Cipher
-	AntiReplay  *esp.AntiReplay
-	RemoteAddr  atomic.Pointer[net.IPAddr]
+	RemoteAddr  atomic.Pointer[net.Addr]
 	Seq         atomic.Uint32
 	LastSeen    atomic.Int64
 }
@@ -147,7 +152,6 @@ func configureFirewall(tunIP string, tunCIDR int) {
 
 		exec.Command("iptables", "-D", "FORWARD", "-s", subnet, "-d", subnet, "-j", "DROP").Run()
 		exec.Command("iptables", "-I", "FORWARD", "1", "-s", subnet, "-d", subnet, "-j", "DROP").Run()
-
 		exec.Command("iptables", "-I", "FORWARD", "2", "-s", subnet, "-j", "ACCEPT").Run()
 		exec.Command("iptables", "-I", "FORWARD", "3", "-d", subnet, "-j", "ACCEPT").Run()
 		exec.Command("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu").Run()
@@ -284,7 +288,7 @@ func handleListUsers(configPath string) {
 		}
 	}
 
-	fmt.Printf("%-15s %-40s %-12s\n", "NAME", "UUID", "SPI")
+	fmt.Printf("%-15s %-40s %-12s\n", "NAME", "UUID", "AUTH_SPI")
 	fmt.Println(strings.Repeat("-", 70))
 	for _, c := range cfg.Clients {
 		name := c.Name
@@ -295,7 +299,7 @@ func handleListUsers(configPath string) {
 		spiStr := "-"
 		if u != "" && len(serverPubBytes) == 32 {
 			if b, err := esp.ParseUUID(u); err == nil {
-				spiStr = fmt.Sprintf("0x%08x", esp.DeriveRealitySPI(b[:], serverPubBytes))
+				spiStr = fmt.Sprintf("0x%08x", esp.DeriveAuthSPI(serverPubBytes, b))
 			}
 		}
 		fmt.Printf("%-15s %-40s %-12s\n", name, u, spiStr)
@@ -390,19 +394,22 @@ func main() {
 	if cfg.TunCIDR <= 0 {
 		cfg.TunCIDR = 16
 	}
+	if cfg.TunIP == "" {
+		cfg.TunIP = "10.99.0.1"
+	}
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = "0.0.0.0"
 	}
 
 	curve := ecdh.X25519()
 	var serverPriv *ecdh.PrivateKey
-
 	if cfg.PrivateKey != "" {
 		dec, err := base64.StdEncoding.DecodeString(cfg.PrivateKey)
 		if err == nil && len(dec) == 32 {
 			serverPriv, _ = curve.NewPrivateKey(dec)
 		}
 	}
+
 	if serverPriv == nil {
 		serverPriv, err = curve.GenerateKey(rand.Reader)
 		if err != nil {
@@ -423,7 +430,9 @@ func main() {
 		_ = os.WriteFile(*configPath, updated, 0600)
 	}
 
-	clientsBySPI := make(map[uint32]*ClientSession)
+	clientsByAuthSPI := make(map[uint32]*ClientSession)
+	var sessionsBySessionSPIMu sync.RWMutex
+	sessionsBySessionSPI := make(map[uint32]*ClientSession)
 	var clientsByTunIPMu sync.RWMutex
 	clientsByTunIP := make(map[uint32]*ClientSession)
 
@@ -441,17 +450,18 @@ func main() {
 		if err != nil {
 			log.Fatalf("invalid uuid for client %s: %v", ce.Name, err)
 		}
-		spiVal := esp.DeriveRealitySPI(ub[:], serverPubBytes)
+		authSPI := esp.DeriveAuthSPI(serverPubBytes, ub)
+		mac1Key := esp.DeriveMac1Key(serverPubBytes, ub)
 
 		session := &ClientSession{
-			Name:       ce.Name,
-			UUID:       ce.UUID,
-			UUIDBytes:  ub,
-			SPI:        spiVal,
-			AntiReplay: esp.NewAntiReplay(),
+			Name:      ce.Name,
+			UUID:      ce.UUID,
+			UUIDBytes: ub,
+			AuthSPI:   authSPI,
+			Mac1Key:   mac1Key,
 		}
 
-		clientsBySPI[spiVal] = session
+		clientsByAuthSPI[authSPI] = session
 	}
 
 	_, clientSubnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", cfg.TunIP, cfg.TunCIDR))
@@ -523,26 +533,33 @@ func main() {
 				return
 			case <-ticker.C:
 				now := time.Now().Unix()
-				for _, session := range clientsBySPI {
+				sessionsBySessionSPIMu.Lock()
+				for sSPI, session := range sessionsBySessionSPI {
 					last := session.LastSeen.Load()
 					if last > 0 && now-last > 600 {
 						currIP := session.CurrentIP.Load()
 						if currIP != nil {
 							ipU32 := session.CurrentIP32.Swap(0)
 							session.CurrentIP.Store(nil)
-							session.CipherMu.Lock()
+
+							session.SessionSPIMu.Lock()
+							session.SessionSPI = 0
 							session.Cipher = nil
-							session.CipherMu.Unlock()
+							session.SessionSPIMu.Unlock()
+
+							delete(sessionsBySessionSPI, sSPI)
 							ipPool.Release(session)
+
 							clientsByTunIPMu.Lock()
 							if ipU32 != 0 {
 								delete(clientsByTunIP, ipU32)
 							}
 							clientsByTunIPMu.Unlock()
-							log.Printf("session %s (0x%08x) expired after 10m idle, released IP %s", session.Name, session.SPI, *currIP)
+							log.Printf("session %s (0x%08x) expired after 10m idle, released IP %s", session.Name, sSPI, *currIP)
 						}
 					}
 				}
+				sessionsBySessionSPIMu.Unlock()
 			}
 		}
 	}()
@@ -570,12 +587,12 @@ func main() {
 				}
 			}
 
-			if n < esp.MinPacketSize {
+			if n < 4 {
 				continue
 			}
 
 			packet := esp.StripIPv4Header(buf[:n])
-			if len(packet) < esp.MinPacketSize {
+			if len(packet) < 4 {
 				continue
 			}
 
@@ -584,97 +601,150 @@ func main() {
 				continue
 			}
 
-			session, ok := clientsBySPI[spi]
-			if !ok {
+			if session, isAuth := clientsByAuthSPI[spi]; isAuth {
+				clientEphPubBytes, _, err := esp.UnpackHandshakeReq(packet, session.Mac1Key, &session.LastHandshakeNano, &session.RateLimitMu)
+				if err != nil {
+					continue
+				}
+
+				clientEphPub, err := curve.NewPublicKey(clientEphPubBytes)
+				if err != nil {
+					continue
+				}
+
+				staticDH, err := serverPriv.ECDH(clientEphPub)
+				if err != nil {
+					continue
+				}
+
+				serverEphPriv, err := curve.GenerateKey(rand.Reader)
+				if err != nil {
+					continue
+				}
+				serverEphPubBytes := serverEphPriv.PublicKey().Bytes()
+
+				ephemeralDH, err := serverEphPriv.ECDH(clientEphPub)
+				if err != nil {
+					continue
+				}
+
+				var newSessionSPI uint32
+				sessionsBySessionSPIMu.Lock()
+				for {
+					s, err := esp.GenerateSessionSPI()
+					if err == nil {
+						if _, exists := sessionsBySessionSPI[s]; !exists {
+							if _, isAuthSPI := clientsByAuthSPI[s]; !isAuthSPI {
+								newSessionSPI = s
+								break
+							}
+						}
+					}
+				}
+
+				_, serverCipher, err := esp.DeriveSessionCiphers(
+					staticDH,
+					ephemeralDH,
+					serverPubBytes,
+					clientEphPubBytes,
+					serverEphPubBytes,
+					session.UUIDBytes,
+				)
+				if err != nil {
+					sessionsBySessionSPIMu.Unlock()
+					continue
+				}
+
+				currIP := session.CurrentIP.Load()
+				if currIP == nil {
+					allocatedIP, err := ipPool.AllocateRandom(session)
+					if err != nil {
+						sessionsBySessionSPIMu.Unlock()
+						log.Printf("ip pool allocation error for %s: %v", session.Name, err)
+						continue
+					}
+					ipU32 := binary.BigEndian.Uint32(allocatedIP.To4())
+					session.CurrentIP32.Store(ipU32)
+					session.CurrentIP.Store(&allocatedIP)
+
+					clientsByTunIPMu.Lock()
+					clientsByTunIP[ipU32] = session
+					clientsByTunIPMu.Unlock()
+					currIP = &allocatedIP
+				}
+
+				session.SessionSPIMu.Lock()
+				oldSessionSPI := session.SessionSPI
+				session.SessionSPI = newSessionSPI
+				session.Cipher = serverCipher
+				session.AntiReplay = esp.NewAntiReplay()
+				session.Seq.Store(0)
+				session.RemoteAddr.Store(&from)
+				session.LastSeen.Store(time.Now().Unix())
+				session.SessionSPIMu.Unlock()
+
+				if oldSessionSPI != 0 {
+					delete(sessionsBySessionSPI, oldSessionSPI)
+				}
+				sessionsBySessionSPI[newSessionSPI] = session
+				sessionsBySessionSPIMu.Unlock()
+
+				respPayload := &esp.HandshakeRespPayload{
+					SessionSPI: newSessionSPI,
+					AssignedIP: *currIP,
+					GatewayIP:  serverTunIP,
+					CIDR:       cfg.TunCIDR,
+					MTU:        cfg.TunMTU,
+					DNS:        net.ParseIP("8.8.8.8"),
+				}
+
+				packedResp, err := esp.PackHandshakeResp(spi, staticDH, clientEphPubBytes, serverEphPubBytes, respPayload)
+				if err == nil {
+					rawConn.WriteTo(packedResp, from)
+					log.Printf("handshake completed for %s from %s. SessionSPI: 0x%08x, Dynamic IP: %s", session.Name, from, newSessionSPI, *currIP)
+				}
 				continue
 			}
 
-			bootTime, seq, err := esp.ExtractBootTimeAndSeq(packet)
+			sessionsBySessionSPIMu.RLock()
+			session, ok := sessionsBySessionSPI[spi]
+			sessionsBySessionSPIMu.RUnlock()
+
+			if !ok || len(packet) < esp.MinPacketSize {
+				continue
+			}
+
+			seq := binary.BigEndian.Uint32(packet[4:8])
+
+			session.SessionSPIMu.RLock()
+			ciph := session.Cipher
+			sSPI := session.SessionSPI
+			ar := session.AntiReplay
+			session.SessionSPIMu.RUnlock()
+
+			if ciph == nil || sSPI != spi || ar == nil {
+				continue
+			}
+
+			if !ar.Check(seq) {
+				continue
+			}
+
+			nextHdr, inner, err := ciph.Unpack(packet)
 			if err != nil {
 				continue
 			}
 
-			var ciph *esp.Cipher
-			session.CipherMu.RLock()
-			ciph = session.Cipher
-			session.CipherMu.RUnlock()
-
-			var nextHdr uint8
-			var inner []byte
-
-			if ciph != nil && session.AntiReplay.Check(bootTime, seq) {
-				nextHdr, inner, err = ciph.Unpack(packet)
-				if err == nil {
-					session.AntiReplay.Update(bootTime, seq)
-				}
-			}
-
-			if inner == nil {
-				newCiph, req, err := esp.UnpackHandshakeReq(packet, serverPriv, session.UUIDBytes)
-				if err == nil {
-					if session.AntiReplay.Check(bootTime, seq) {
-						session.AntiReplay.Update(bootTime, seq)
-					}
-					session.CipherMu.Lock()
-					session.Cipher = newCiph
-					session.CipherMu.Unlock()
-					ciph = newCiph
-
-					allocatedIP, err := ipPool.AllocateRandom(session)
-					if err == nil {
-						ipU32 := binary.BigEndian.Uint32(allocatedIP.To4())
-						oldIPU32 := session.CurrentIP32.Swap(ipU32)
-						session.CurrentIP.Store(&allocatedIP)
-
-						clientsByTunIPMu.Lock()
-						if oldIPU32 != 0 && oldIPU32 != ipU32 {
-							delete(clientsByTunIP, oldIPU32)
-						}
-						clientsByTunIP[ipU32] = session
-						clientsByTunIPMu.Unlock()
-						log.Printf("client 0x%08x (%s) allocated dynamic random IP: %s (req bootTime: %d)", session.SPI, session.Name, allocatedIP, req.BootTime)
-					}
-
-					if ipAddr, ok := from.(*net.IPAddr); ok {
-						session.RemoteAddr.Store(ipAddr)
-					}
-					session.LastSeen.Store(time.Now().Unix())
-
-					currIP := session.CurrentIP.Load()
-					if currIP != nil {
-						respBytes := esp.EncodeHandshakeResp(*currIP, serverTunIP, cfg.TunCIDR, cfg.TunMTU, net.ParseIP("8.8.8.8"))
-						respSeq := session.Seq.Add(1)
-						packedResp, err := ciph.Pack(session.SPI, respSeq, esp.ProtoControl, respBytes)
-						if err == nil {
-							targetAddr := session.RemoteAddr.Load()
-							if targetAddr != nil {
-								rawConn.WriteTo(packedResp, targetAddr)
-							}
-						}
-					}
-					continue
-				}
-				continue
-			}
-
+			ar.Update(seq)
+			session.RemoteAddr.Store(&from)
 			session.LastSeen.Store(time.Now().Unix())
-
-			if ipAddr, ok := from.(*net.IPAddr); ok {
-				current := session.RemoteAddr.Load()
-				if current == nil || !current.IP.Equal(ipAddr.IP) {
-					session.RemoteAddr.Store(ipAddr)
-				}
-			}
 
 			if nextHdr == esp.ProtoControl {
 				if len(inner) > 0 && inner[0] == esp.ControlKeepalive {
 					ackSeq := session.Seq.Add(1)
-					packedAck, err := ciph.Pack(session.SPI, ackSeq, esp.ProtoControl, []byte{esp.ControlKeepalive})
+					packedAck, err := ciph.Pack(sSPI, ackSeq, esp.ProtoControl, []byte{esp.ControlKeepalive})
 					if err == nil {
-						targetAddr := session.RemoteAddr.Load()
-						if targetAddr != nil {
-							rawConn.WriteTo(packedAck, targetAddr)
-						}
+						rawConn.WriteTo(packedAck, from)
 					}
 				}
 				continue
@@ -755,21 +825,22 @@ func main() {
 					continue
 				}
 
-				session.CipherMu.RLock()
+				session.SessionSPIMu.RLock()
 				ciph := session.Cipher
-				session.CipherMu.RUnlock()
+				sSPI := session.SessionSPI
+				session.SessionSPIMu.RUnlock()
 
-				if ciph == nil {
+				if ciph == nil || sSPI == 0 {
 					continue
 				}
 
 				seq := session.Seq.Add(1)
-				packed, err := ciph.Pack(session.SPI, seq, esp.ProtoIPv4, buf[:n])
+				packed, err := ciph.Pack(sSPI, seq, esp.ProtoIPv4, buf[:n])
 				if err != nil {
 					continue
 				}
 
-				if _, err := rawConn.WriteTo(packed, targetAddr); err != nil {
+				if _, err := rawConn.WriteTo(packed, *targetAddr); err != nil {
 					select {
 					case <-ctx.Done():
 						return
@@ -781,9 +852,9 @@ func main() {
 	}
 
 	if cfg.DisableTun {
-		log.Printf("esp-server running. Listening: %s (Proto 50), TUN: disabled (no-tun mode), Reality ECDH active", cfg.ListenAddr)
+		log.Printf("esp-server running. Listening: %s (Proto 50), TUN: disabled (no-tun mode), Reality v2 Forward Secrecy active", cfg.ListenAddr)
 	} else {
-		log.Printf("esp-server running. Listening: %s (Proto 50), Tun: %s (%s), Reality ECDH + /16 Dynamic Random Pool active", cfg.ListenAddr, cfg.TunName, cidrStr)
+		log.Printf("esp-server running. Listening: %s (Proto 50), Tun: %s (%s), Reality v2 Forward Secrecy + /16 Dynamic Random Pool active", cfg.ListenAddr, cfg.TunName, cidrStr)
 	}
 	wg.Wait()
 	log.Printf("esp-server exited cleanly")

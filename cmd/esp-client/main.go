@@ -6,9 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -30,36 +28,17 @@ import (
 )
 
 type Config struct {
-	ServerAddr       string          `json:"server_addr"`
-	ServerPubKey     string          `json:"server_public_key,omitempty"`
-	UUID             string          `json:"uuid,omitempty"`
-	PrivateKey       string          `json:"private_key,omitempty"`
-	Key              string          `json:"key,omitempty"`
-	ServerKey        string          `json:"server_key,omitempty"`
-	BindInterface    string          `json:"bind_interface"`
-	Gateway          string          `json:"gateway"`
-	TunName          string          `json:"tun_name"`
-	TunIP            string          `json:"tun_ip,omitempty"`
-	TunCIDR          int             `json:"tun_cidr,omitempty"`
-	TunMTU           int             `json:"tun_mtu,omitempty"`
-	DisableTun       bool            `json:"disable_tun,omitempty"`
-	DisableSocks     bool            `json:"disable_socks,omitempty"`
-	SPI              json.RawMessage `json:"spi,omitempty"`
-	KeepaliveSeconds int             `json:"keepalive_seconds"`
-	SocksListen      string          `json:"socks_listen"`
-}
-
-func parseSPI(raw json.RawMessage) (uint32, error) {
-	var strVal string
-	if err := json.Unmarshal(raw, &strVal); err == nil {
-		val, err := strconv.ParseUint(strVal, 0, 32)
-		return uint32(val), err
-	}
-	var numVal uint64
-	if err := json.Unmarshal(raw, &numVal); err == nil {
-		return uint32(numVal), nil
-	}
-	return 0, errors.New("invalid spi format")
+	ServerAddr       string `json:"server_addr"`
+	ServerPubKey     string `json:"server_public_key"`
+	UUID             string `json:"uuid"`
+	BindInterface    string `json:"bind_interface"`
+	Gateway          string `json:"gateway"`
+	TunName          string `json:"tun_name"`
+	TunMTU           int    `json:"tun_mtu,omitempty"`
+	DisableTun       bool   `json:"disable_tun,omitempty"`
+	DisableSocks     bool   `json:"disable_socks,omitempty"`
+	KeepaliveSeconds int    `json:"keepalive_seconds"`
+	SocksListen      string `json:"socks_listen"`
 }
 
 func configureFirewall() {
@@ -119,25 +98,23 @@ func cleanupClientRouting(tunName, tunIP string) {
 }
 
 type ClientCipherState struct {
-	mu           sync.RWMutex
-	cipher       *esp.Cipher
-	ephemeralPub []byte
+	mu     sync.RWMutex
+	cipher *esp.SessionCipher
 }
 
-func (s *ClientCipherState) Get() (*esp.Cipher, []byte) {
+func (s *ClientCipherState) Get() *esp.SessionCipher {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.cipher, s.ephemeralPub
+	return s.cipher
 }
 
-func (s *ClientCipherState) Set(c *esp.Cipher, pub []byte) {
+func (s *ClientCipherState) Set(c *esp.SessionCipher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cipher = c
-	s.ephemeralPub = pub
 }
 
-func handleSocksClient(clientConn net.Conn, socksListen string, getTunIP func() string, tunName, dnsIP string) {
+func handleSocksClient(ctx context.Context, clientConn net.Conn, socksListen string, getTunIP func() string, tunName, dnsIP string) {
 	defer clientConn.Close()
 
 	buf := make([]byte, 262)
@@ -252,48 +229,38 @@ func handleSocksClient(clientConn net.Conn, socksListen string, getTunIP func() 
 	if parsed := net.ParseIP(currentIP).To4(); parsed != nil {
 		copy(resp[4:8], parsed)
 	}
-	if tcpLocal, ok := targetConn.LocalAddr().(*net.TCPAddr); ok {
-		if ip4 := tcpLocal.IP.To4(); ip4 != nil {
-			copy(resp[4:8], ip4)
-			binary.BigEndian.PutUint16(resp[8:10], uint16(tcpLocal.Port))
-		}
-	}
 	if _, err := clientConn.Write(resp); err != nil {
 		return
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	errChan := make(chan error, 2)
 	go func() {
-		defer wg.Done()
-		io.Copy(targetConn, clientConn)
-		if tc, ok := targetConn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
+		_, err := io.Copy(targetConn, clientConn)
+		errChan <- err
 	}()
 	go func() {
-		defer wg.Done()
-		io.Copy(clientConn, targetConn)
-		if cc, ok := clientConn.(*net.TCPConn); ok {
-			cc.CloseWrite()
-		}
+		_, err := io.Copy(clientConn, targetConn)
+		errChan <- err
 	}()
-	wg.Wait()
+
+	select {
+	case <-errChan:
+	case <-ctx.Done():
+	}
 }
 
 func startSocksServer(ctx context.Context, socksListen string, getTunIP func() string, tunName, dnsIP string) {
-	if socksListen == "" {
+	if socksListen == "" || socksListen == "none" {
 		return
 	}
 	ln, err := net.Listen("tcp", socksListen)
 	if err != nil {
-		log.Printf("socks5 listener failed: %v", err)
+		log.Printf("socks5 listen failed on %s: %v", socksListen, err)
 		return
 	}
 	defer ln.Close()
 
-	log.Printf("embedded socks5 proxy listening on %s (bound to %s)", socksListen, tunName)
-
+	log.Printf("embedded SOCKS5 proxy listening on %s (routed via %s)", socksListen, tunName)
 	go func() {
 		<-ctx.Done()
 		ln.Close()
@@ -309,7 +276,7 @@ func startSocksServer(ctx context.Context, socksListen string, getTunIP func() s
 				continue
 			}
 		}
-		go handleSocksClient(conn, socksListen, getTunIP, tunName, dnsIP)
+		go handleSocksClient(ctx, conn, socksListen, getTunIP, tunName, dnsIP)
 	}
 }
 
@@ -420,120 +387,55 @@ func main() {
 		}
 	}
 
-	clientBootTime := uint32(time.Now().Unix())
 	curve := ecdh.X25519()
 
-	var spiVal uint32
-	var uuidBytes [16]byte
-	var serverPubKey *ecdh.PublicKey
-	cipherState := &ClientCipherState{}
-
-	if cfg.ServerPubKey != "" && cfg.UUID != "" {
-		pubB, err := base64.StdEncoding.DecodeString(cfg.ServerPubKey)
-		if err != nil || len(pubB) != 32 {
-			log.Fatalf("invalid server_public_key: %v", err)
-		}
-		sp, err := curve.NewPublicKey(pubB)
-		if err != nil {
-			log.Fatalf("invalid server curve point: %v", err)
-		}
-		serverPubKey = sp
-
-		ub, err := esp.ParseUUID(cfg.UUID)
-		if err != nil {
-			log.Fatalf("invalid uuid: %v", err)
-		}
-		uuidBytes = ub
-		spiVal = esp.DeriveRealitySPI(ub[:], pubB)
-
-		renewCipher := func() error {
-			ePriv, err := curve.GenerateKey(rand.Reader)
-			if err != nil {
-				return err
-			}
-			ePub := ePriv.PublicKey()
-			sec, err := ePriv.ECDH(serverPubKey)
-			if err != nil {
-				return err
-			}
-			sKey, sSalt := esp.DeriveRealitySessionKey(sec, uuidBytes[:])
-			ciph, err := esp.NewCipherWithKeySalt(sKey, sSalt, clientBootTime)
-			if err != nil {
-				return err
-			}
-			cipherState.Set(ciph, ePub.Bytes())
-			return nil
-		}
-
-		if err := renewCipher(); err != nil {
-			log.Fatalf("cipher initialization failed: %v", err)
-		}
-	} else if cfg.UUID != "" && (cfg.PrivateKey != "" || cfg.Key != "" || cfg.ServerKey != "") {
-		kStr := cfg.PrivateKey
-		if kStr == "" {
-			kStr = cfg.Key
-		}
-		if kStr == "" {
-			kStr = cfg.ServerKey
-		}
-		ub, err := esp.ParseUUID(cfg.UUID)
-		if err != nil {
-			log.Fatalf("invalid uuid: %v", err)
-		}
-		uuidBytes = ub
-		spiVal = esp.DeriveSPIFromUUID(ub[:])
-
-		masterKeyBytes, err := esp.DecodeMasterKey(kStr)
-		if err != nil {
-			log.Fatalf("failed to decode master key: %v", err)
-		}
-		aesKey, salt := esp.DeriveUserKeyAndSalt(masterKeyBytes, ub[:])
-		ciph, err := esp.NewCipherWithKeySalt(aesKey, salt, clientBootTime)
-		if err != nil {
-			log.Fatalf("cipher initialization failed: %v", err)
-		}
-		cipherState.Set(ciph, nil)
-	} else if cfg.Key != "" {
-		spi, err := parseSPI(cfg.SPI)
-		if err != nil {
-			log.Fatalf("invalid spi: %v", err)
-		}
-		spiVal = spi
-		keyBytes, err := hex.DecodeString(cfg.Key)
-		if err != nil {
-			log.Fatalf("invalid hex key: %v", err)
-		}
-		ciph, err := esp.NewCipher(keyBytes, clientBootTime)
-		if err != nil {
-			log.Fatalf("cipher initialization failed: %v", err)
-		}
-		cipherState.Set(ciph, nil)
-	} else {
-		log.Fatalf("config must provide 'server_public_key' and 'uuid'")
+	if cfg.ServerPubKey == "" || cfg.UUID == "" {
+		log.Fatalf("server_public_key and uuid are required in %s", *configPath)
 	}
 
-	serverIP := net.ParseIP(cfg.ServerAddr)
-	if serverIP == nil {
-		log.Fatalf("invalid server address: %s", cfg.ServerAddr)
+	pubB, err := base64.StdEncoding.DecodeString(cfg.ServerPubKey)
+	if err != nil || len(pubB) != 32 {
+		log.Fatalf("invalid server_public_key: %v", err)
 	}
-	serverRemoteAddr := &net.IPAddr{IP: serverIP}
+	serverPubKey, err := curve.NewPublicKey(pubB)
+	if err != nil {
+		log.Fatalf("invalid server public key point: %v", err)
+	}
+
+	uuidBytes, err := esp.ParseUUID(cfg.UUID)
+	if err != nil {
+		log.Fatalf("invalid uuid: %v", err)
+	}
+
+	authSPI := esp.DeriveAuthSPI(pubB, uuidBytes)
+	mac1Key := esp.DeriveMac1Key(pubB, uuidBytes)
 
 	configureFirewall()
 	defer cleanupFirewall()
 
+	if cfg.BindInterface != "" {
+		setupRoute(cfg.ServerAddr, cfg.BindInterface, cfg.Gateway)
+		defer cleanupRoute(cfg.ServerAddr, cfg.BindInterface)
+	}
+
 	rawConn, err := net.ListenPacket("ip4:50", "0.0.0.0")
 	if err != nil {
-		log.Fatalf("failed to open raw esp socket: %v", err)
+		log.Fatalf("failed to open raw socket: %v (run with sudo / CAP_NET_RAW)", err)
 	}
 	defer rawConn.Close()
 
 	if cfg.BindInterface != "" {
-		rawSys, err := rawConn.(*net.IPConn).SyscallConn()
+		rawConnFile, err := rawConn.(*net.IPConn).File()
 		if err == nil {
-			rawSys.Control(func(fd uintptr) {
-				syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, cfg.BindInterface)
-			})
+			fd := int(rawConnFile.Fd())
+			_ = syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, cfg.BindInterface)
+			rawConnFile.Close()
 		}
+	}
+
+	serverRemoteAddr, err := net.ResolveIPAddr("ip4", cfg.ServerAddr)
+	if err != nil {
+		log.Fatalf("failed to resolve server addr %s: %v", cfg.ServerAddr, err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -546,6 +448,15 @@ func main() {
 	handshakeDone := make(chan struct{})
 	var handshakeOnce sync.Once
 	var lastServerPacket atomic.Int64
+	var activeSessionSPI atomic.Uint32
+	var seq atomic.Uint32
+	var lastRekeyTime atomic.Int64
+
+	antiReplay := esp.NewAntiReplay()
+	cipherState := &ClientCipherState{}
+
+	var currentEphPrivMu sync.RWMutex
+	var currentEphPriv *ecdh.PrivateKey
 
 	go func() {
 		<-sigChan
@@ -560,8 +471,6 @@ func main() {
 		}
 		tunMu.Unlock()
 	}()
-
-	var seq atomic.Uint32
 
 	getTunIP := func() string {
 		tunMu.Lock()
@@ -628,13 +537,20 @@ func main() {
 		}
 	}
 
-	isReady := func() bool {
-		tunMu.Lock()
-		defer tunMu.Unlock()
-		if cfg.DisableTun {
-			return assignedTunIP != ""
+	sendHandshake := func() {
+		ePriv, err := curve.GenerateKey(rand.Reader)
+		if err != nil {
+			log.Printf("failed to generate ephemeral key: %v", err)
+			return
 		}
-		return tunDev != nil
+		currentEphPrivMu.Lock()
+		currentEphPriv = ePriv
+		currentEphPrivMu.Unlock()
+
+		reqPkt, _, err := esp.PackHandshakeReq(authSPI, ePriv.PublicKey().Bytes(), mac1Key)
+		if err == nil {
+			rawConn.WriteTo(reqPkt, serverRemoteAddr)
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -653,56 +569,33 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-handshakeTicker.C:
-				ready := isReady()
-				if !ready {
-					ciph, epub := cipherState.Get()
-					if ciph != nil {
-						pSeq := seq.Add(1)
-						var packed []byte
-						if len(epub) == 32 {
-							packed, err = ciph.PackHandshakeReq(spiVal, pSeq, epub, uuidBytes[:])
-						} else {
-							reqData := esp.EncodeHandshakeReq(clientBootTime, uuidBytes[:])
-							packed, err = ciph.Pack(spiVal, pSeq, esp.ProtoControl, reqData)
-						}
-						if err == nil {
-							rawConn.WriteTo(packed, serverRemoteAddr)
-						}
-					}
+				if activeSessionSPI.Load() == 0 {
+					sendHandshake()
 				}
 			case <-ticker.C:
-				ready := isReady()
-				if ready {
+				sSPI := activeSessionSPI.Load()
+				if sSPI != 0 {
 					now := time.Now().Unix()
 					last := lastServerPacket.Load()
-					if last > 0 && now-last > 60 && serverPubKey != nil {
-						log.Printf("session inactive >60s, renewing Reality handshake...")
-						lastServerPacket.Store(now)
-						newBootTime := uint32(time.Now().Unix())
-						ePriv, err := curve.GenerateKey(rand.Reader)
-						if err == nil {
-							ePub := ePriv.PublicKey()
-							sec, err := ePriv.ECDH(serverPubKey)
-							if err == nil {
-								sKey, sSalt := esp.DeriveRealitySessionKey(sec, uuidBytes[:])
-								ciph, err := esp.NewCipherWithKeySalt(sKey, sSalt, newBootTime)
-								if err == nil {
-									cipherState.Set(ciph, ePub.Bytes())
-									pSeq := seq.Add(1)
-									packed, err := ciph.PackHandshakeReq(spiVal, pSeq, ePub.Bytes(), uuidBytes[:])
-									if err == nil {
-										rawConn.WriteTo(packed, serverRemoteAddr)
-									}
-								}
-							}
-						}
+					rekeyTime := lastRekeyTime.Load()
+
+					if rekeyTime > 0 && (now-rekeyTime > 7200 || seq.Load() >= (1<<30)) {
+						log.Printf("initiating periodic rekey (2h session or seq threshold)...")
+						sendHandshake()
 						continue
 					}
 
-					ciph, _ := cipherState.Get()
+					if last > 0 && now-last > 60 {
+						log.Printf("session inactive >60s, renewing handshake...")
+						lastServerPacket.Store(now)
+						sendHandshake()
+						continue
+					}
+
+					ciph := cipherState.Get()
 					if ciph != nil {
 						pSeq := seq.Add(1)
-						packed, err := ciph.Pack(spiVal, pSeq, esp.ProtoControl, []byte{esp.ControlKeepalive})
+						packed, err := ciph.Pack(sSPI, pSeq, esp.ProtoControl, []byte{esp.ControlKeepalive})
 						if err == nil {
 							rawConn.WriteTo(packed, serverRemoteAddr)
 						}
@@ -733,21 +626,94 @@ func main() {
 				}
 			}
 
-			if n < esp.MinPacketSize {
+			if n < 4 {
 				continue
 			}
 
 			packet := esp.StripIPv4Header(buf[:n])
-			if len(packet) < esp.MinPacketSize {
+			if len(packet) < 4 {
 				continue
 			}
 
 			packetSPI, err := esp.PeekSPI(packet)
-			if err != nil || packetSPI != spiVal {
+			if err != nil {
 				continue
 			}
 
-			ciph, _ := cipherState.Get()
+			if packetSPI == authSPI {
+				currentEphPrivMu.RLock()
+				ePriv := currentEphPriv
+				currentEphPrivMu.RUnlock()
+
+				if ePriv == nil {
+					continue
+				}
+
+				staticDH, err := ePriv.ECDH(serverPubKey)
+				if err != nil {
+					continue
+				}
+
+				serverEphPubBytes, resp, err := esp.UnpackHandshakeResp(packet, authSPI, staticDH, ePriv.PublicKey().Bytes())
+				if err != nil {
+					continue
+				}
+
+				serverEphPub, err := curve.NewPublicKey(serverEphPubBytes)
+				if err != nil {
+					continue
+				}
+
+				ephemeralDH, err := ePriv.ECDH(serverEphPub)
+				if err != nil {
+					continue
+				}
+
+				clientCipher, _, err := esp.DeriveSessionCiphers(
+					staticDH,
+					ephemeralDH,
+					pubB,
+					ePriv.PublicKey().Bytes(),
+					serverEphPubBytes,
+					uuidBytes,
+				)
+				if err != nil {
+					continue
+				}
+
+				activeSessionSPI.Store(resp.SessionSPI)
+				cipherState.Set(clientCipher)
+				seq.Store(0)
+				lastRekeyTime.Store(time.Now().Unix())
+				lastServerPacket.Store(time.Now().Unix())
+
+				assignedIPStr := resp.AssignedIP.String()
+				gatewayIPStr := resp.GatewayIP.String()
+				dnsStr := resp.DNS.String()
+
+				initTunDevice(assignedIPStr, gatewayIPStr, resp.CIDR, resp.MTU, dnsStr)
+				handshakeOnce.Do(func() {
+					log.Printf("handshake completed! SessionSPI: 0x%08x, Assigned Dynamic IP: %s/16, Gateway: %s", resp.SessionSPI, assignedIPStr, gatewayIPStr)
+					close(handshakeDone)
+				})
+				continue
+			}
+
+			sSPI := activeSessionSPI.Load()
+			if sSPI == 0 || packetSPI != sSPI {
+				continue
+			}
+
+			if len(packet) < esp.MinPacketSize {
+				continue
+			}
+
+			pktSeq := binary.BigEndian.Uint32(packet[4:8])
+			if !antiReplay.Check(pktSeq) {
+				continue
+			}
+
+			ciph := cipherState.Get()
 			if ciph == nil {
 				continue
 			}
@@ -757,22 +723,10 @@ func main() {
 				continue
 			}
 
+			antiReplay.Update(pktSeq)
 			lastServerPacket.Store(time.Now().Unix())
 
 			if nextHdr == esp.ProtoControl {
-				if len(inner) > 0 && inner[0] == esp.ControlHandshakeResp {
-					resp, err := esp.DecodeHandshakeResp(inner)
-					if err == nil {
-						assignedIPStr := resp.AssignedIP.String()
-						gatewayIPStr := resp.GatewayIP.String()
-						dnsStr := resp.DNS.String()
-						initTunDevice(assignedIPStr, gatewayIPStr, resp.CIDR, resp.MTU, dnsStr)
-						handshakeOnce.Do(func() {
-							log.Printf("handshake completed! Assigned Dynamic IP: %s/16, Gateway: %s", assignedIPStr, gatewayIPStr)
-							close(handshakeDone)
-						})
-					}
-				}
 				continue
 			}
 
@@ -825,13 +779,14 @@ func main() {
 				continue
 			}
 
-			ciph, _ := cipherState.Get()
-			if ciph == nil {
+			ciph := cipherState.Get()
+			sSPI := activeSessionSPI.Load()
+			if ciph == nil || sSPI == 0 {
 				continue
 			}
 
 			pSeq := seq.Add(1)
-			packed, err := ciph.Pack(spiVal, pSeq, esp.ProtoIPv4, buf[:n])
+			packed, err := ciph.Pack(sSPI, pSeq, esp.ProtoIPv4, buf[:n])
 			if err != nil {
 				continue
 			}
@@ -851,9 +806,9 @@ func main() {
 		tunState = "disabled (no-tun)"
 	}
 	if cfg.BindInterface != "" {
-		log.Printf("esp-client running. Target: %s, spi: 0x%08x, tun: %s, dev: %s", cfg.ServerAddr, spiVal, tunState, cfg.BindInterface)
+		log.Printf("esp-client running. Target: %s, AuthSPI: 0x%08x, tun: %s, dev: %s", cfg.ServerAddr, authSPI, tunState, cfg.BindInterface)
 	} else {
-		log.Printf("esp-client running. Target: %s, spi: 0x%08x, tun: %s", cfg.ServerAddr, spiVal, tunState)
+		log.Printf("esp-client running. Target: %s, AuthSPI: 0x%08x, tun: %s", cfg.ServerAddr, authSPI, tunState)
 	}
 	wg.Wait()
 

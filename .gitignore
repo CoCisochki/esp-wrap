@@ -13,6 +13,7 @@ server.json
 client.json
 client_*.json
 *.tar.gz
+*.zip
 
 # Runtime logs and PID files
 *.log

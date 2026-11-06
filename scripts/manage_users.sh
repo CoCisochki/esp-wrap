@@ -8,44 +8,26 @@ cd "$ROOT_DIR"
 
 usage() {
     echo "ESP-Wrap User Management:"
-    echo "  $0 add <USER> <SERVER_IP> [ROOT_PASSWORD]   - Add user and build client package"
-    echo "  $0 list <SERVER_IP> [ROOT_PASSWORD]        - List registered users"
-    echo "  $0 del <USER> <SERVER_IP> [ROOT_PASSWORD]   - Delete user"
+    echo "  $0 add <USER> <SERVER_IP>   - Add user and build client package"
+    echo "  $0 list <SERVER_IP>        - List registered users"
+    echo "  $0 del <USER> <SERVER_IP>   - Delete user"
     echo ""
     echo "Examples:"
     echo "  $0 add alice 198.51.100.1"
-    echo "  $0 list 198.51.100.1 'MySecretPassword'"
+    echo "  $0 list 198.51.100.1"
     exit 1
 }
 
 run_ssh() {
     local host="$1"
     local cmd="$2"
-    local pass="${3:-}"
-    if [ -n "$pass" ]; then
-        if ! command -v sshpass >/dev/null 2>&1; then
-            echo "Error: sshpass is required when passing password." >&2
-            exit 1
-        fi
-        sshpass -p "$pass" ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$host" "$cmd"
-    else
-        ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$host" "$cmd"
-    fi
+    ssh -o ConnectTimeout=10 "root@$host" "$cmd"
 }
 
 run_scp() {
     local src="$1"
     local dst="$2"
-    local pass="${3:-}"
-    if [ -n "$pass" ]; then
-        if ! command -v sshpass >/dev/null 2>&1; then
-            echo "Error: sshpass is required when passing password." >&2
-            exit 1
-        fi
-        sshpass -p "$pass" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$src" "$dst"
-    else
-        scp -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$src" "$dst"
-    fi
+    scp -o ConnectTimeout=10 "$src" "$dst"
 }
 
 get_ssh_target() {
@@ -70,7 +52,6 @@ case "$CMD" in
     add)
         USER_NAME="${2:-}"
         SERVER_IP="${3:-}"
-        ROOT_PASS="${4:-${SSH_PASS:-}}"
         if [ -z "$USER_NAME" ] || [ -z "$SERVER_IP" ]; then
             usage
         fi
@@ -78,14 +59,14 @@ case "$CMD" in
         SSH_TARGET=$(get_ssh_target "$SERVER_IP")
 
         echo "[1/4] Adding user '$USER_NAME' on server $SERVER_IP (via $SSH_TARGET)..."
-        run_ssh "$SSH_TARGET" "/opt/esp-wrap/esp-server -c /opt/esp-wrap/server.json -add-user $USER_NAME" "$ROOT_PASS"
+        run_ssh "$SSH_TARGET" "/opt/esp-wrap/esp-server -c /opt/esp-wrap/server.json -add-user $USER_NAME"
 
         OUT_DIR="$ROOT_DIR/generated_clients/$SERVER_IP"
         UDIR="$OUT_DIR/$USER_NAME"
         mkdir -p "$UDIR"
 
         echo "[2/4] Downloading user config profile..."
-        run_scp "root@$SSH_TARGET:/opt/esp-wrap/client_${USER_NAME}.json" "$OUT_DIR/" "$ROOT_PASS"
+        run_scp "root@$SSH_TARGET:/opt/esp-wrap/client_${USER_NAME}.json" "$OUT_DIR/"
 
         echo "[3/4] Building client package for $USER_NAME..."
         if [ ! -f "$ROOT_DIR/bin/esp-client" ]; then
@@ -108,25 +89,23 @@ case "$CMD" in
 
     list)
         SERVER_IP="${2:-}"
-        ROOT_PASS="${3:-${SSH_PASS:-}}"
         if [ -z "$SERVER_IP" ]; then
             usage
         fi
         SSH_TARGET=$(get_ssh_target "$SERVER_IP")
         echo "[-] Registered users on $SERVER_IP (via $SSH_TARGET):"
-        run_ssh "$SSH_TARGET" "/opt/esp-wrap/esp-server -c /opt/esp-wrap/server.json -list-users" "$ROOT_PASS"
+        run_ssh "$SSH_TARGET" "/opt/esp-wrap/esp-server -c /opt/esp-wrap/server.json -list-users"
         ;;
 
     del)
         USER_NAME="${2:-}"
         SERVER_IP="${3:-}"
-        ROOT_PASS="${4:-${SSH_PASS:-}}"
         if [ -z "$USER_NAME" ] || [ -z "$SERVER_IP" ]; then
             usage
         fi
         SSH_TARGET=$(get_ssh_target "$SERVER_IP")
         echo "[-] Removing user '$USER_NAME' from $SERVER_IP (via $SSH_TARGET)..."
-        run_ssh "$SSH_TARGET" "/opt/esp-wrap/esp-server -c /opt/esp-wrap/server.json -del-user $USER_NAME" "$ROOT_PASS"
+        run_ssh "$SSH_TARGET" "/opt/esp-wrap/esp-server -c /opt/esp-wrap/server.json -del-user $USER_NAME"
         rm -rf "$ROOT_DIR/generated_clients/$SERVER_IP/$USER_NAME" "$ROOT_DIR/generated_clients/$SERVER_IP/esp-client-${USER_NAME}.tar.gz" 2>/dev/null || true
         echo "[+] User '$USER_NAME' deleted."
         ;;
