@@ -254,7 +254,7 @@ func handleSocksClient(ctx context.Context, clientConn net.Conn, socksListen str
 		},
 	}
 
-	targetConn, err := dialer.DialContext(context.Background(), "tcp", targetAddr)
+	targetConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
 		clientConn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return

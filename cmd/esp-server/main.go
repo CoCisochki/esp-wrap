@@ -142,11 +142,13 @@ func calculateSubnet(tunIP string, tunCIDR int) string {
 }
 
 func configureFirewall(tunIP string, tunCIDR int) {
-	exec.Command("iptables", "-C", "INPUT", "-p", "esp", "-j", "ACCEPT").Run()
-	exec.Command("iptables", "-I", "INPUT", "-p", "esp", "-j", "ACCEPT").Run()
+	if err := exec.Command("iptables", "-C", "INPUT", "-p", "esp", "-j", "ACCEPT").Run(); err != nil {
+		exec.Command("iptables", "-I", "INPUT", "-p", "esp", "-j", "ACCEPT").Run()
+	}
 
-	exec.Command("iptables", "-C", "OUTPUT", "-p", "icmp", "--icmp-type", "3/2", "-j", "DROP").Run()
-	exec.Command("iptables", "-I", "OUTPUT", "-p", "icmp", "--icmp-type", "3/2", "-j", "DROP").Run()
+	if err := exec.Command("iptables", "-C", "OUTPUT", "-p", "icmp", "--icmp-type", "3/2", "-j", "DROP").Run(); err != nil {
+		exec.Command("iptables", "-I", "OUTPUT", "-p", "icmp", "--icmp-type", "3/2", "-j", "DROP").Run()
+	}
 
 	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 
@@ -156,11 +158,18 @@ func configureFirewall(tunIP string, tunCIDR int) {
 			exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet, "!", "-d", subnet, "-j", "MASQUERADE").Run()
 		}
 
-		exec.Command("iptables", "-D", "FORWARD", "-s", subnet, "-d", subnet, "-j", "DROP").Run()
-		exec.Command("iptables", "-I", "FORWARD", "1", "-s", subnet, "-d", subnet, "-j", "DROP").Run()
-		exec.Command("iptables", "-I", "FORWARD", "2", "-s", subnet, "-j", "ACCEPT").Run()
-		exec.Command("iptables", "-I", "FORWARD", "3", "-d", subnet, "-j", "ACCEPT").Run()
-		exec.Command("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu").Run()
+		if err := exec.Command("iptables", "-C", "FORWARD", "-s", subnet, "-d", subnet, "-j", "DROP").Run(); err != nil {
+			exec.Command("iptables", "-I", "FORWARD", "1", "-s", subnet, "-d", subnet, "-j", "DROP").Run()
+		}
+		if err := exec.Command("iptables", "-C", "FORWARD", "-s", subnet, "-j", "ACCEPT").Run(); err != nil {
+			exec.Command("iptables", "-I", "FORWARD", "2", "-s", subnet, "-j", "ACCEPT").Run()
+		}
+		if err := exec.Command("iptables", "-C", "FORWARD", "-d", subnet, "-j", "ACCEPT").Run(); err != nil {
+			exec.Command("iptables", "-I", "FORWARD", "3", "-d", subnet, "-j", "ACCEPT").Run()
+		}
+		if err := exec.Command("iptables", "-t", "mangle", "-C", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu").Run(); err != nil {
+			exec.Command("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu").Run()
+		}
 	}
 }
 
