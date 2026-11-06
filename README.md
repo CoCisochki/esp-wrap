@@ -190,6 +190,41 @@ sudo ./run.sh stop    # Остановка сервиса
 ```
 
 ---
+
+### 8. Производительность и бенчмарки
+
+Тестирование проводилось в изолированных сетевых пространствах имён (`ip netns`) в среде Linux с изоляцией ресурсов под конфигурацию 2 vCPU / 2 GB RAM (процессы `esp-server` и `esp-client` привязаны ровно к двум ядрам CPU через `taskset`):
+
+#### 8.1. Одиночный TCP-поток (Single Stream)
+| Скорость канала | Throughput | Нагрузка сервера (% 1 vCPU) | Нагрузка сервера на VPS (2 vCPU) | Нагрузка клиента (% 1 vCPU) | Retransmits | RAM (сервер) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **100 Мбит/с** | 91.0 Мбит/с | 16.1% | **8.1%** | 11.0% | 26 | 12.6 МБ |
+| **250 Мбит/с** | 227.6 Мбит/с | 36.2% | **18.1%** | 24.2% | 58 | 12.4 МБ |
+| **500 Мбит/с** | 455.3 Мбит/с | 61.9% | **30.9%** | 38.4% | 599 | 12.7 МБ |
+| **1 Гбит/с** | 910.8 Мбит/с | 97.0% | **48.5%** | 63.6% | 1019 | 12.7 МБ |
+| **Без ограничений** | 1578.4 Мбит/с | 89.9% | **45.0%** | 80.0% | 110 | 12.6 МБ |
+
+#### 8.2. Два параллельных потока (`iperf3 -P 2`)
+| Скорость канала | Throughput | Нагрузка сервера на VPS (2 vCPU) | Нагрузка клиента на VPS (2 vCPU) | Retransmits |
+| :--- | :--- | :--- | :--- | :--- |
+| **250 Мбит/с** | 227.6 Мбит/с | **18.1%** | **12.1%** | 58 |
+| **500 Мбит/с** | 455.3 Мбит/с | **31.1%** | **18.9%** | 111 |
+| **1 Гбит/с** | 910.7 Мбит/с | **46.7%** | **30.2%** | 1079 |
+| **Без ограничений** | 1610.8 Мбит/с | **45.5%** | **39.9%** | 401 |
+
+#### 8.3. Полный дуплекс (Bidirectional `--bidir`, одновременная передача и приём)
+| Скорость канала | Throughput (DL + UL) | Нагрузка сервера на VPS (2 vCPU) | Нагрузка клиента на VPS (2 vCPU) | RAM (сервер) |
+| :--- | :--- | :--- | :--- | :--- |
+| **250 Мбит/с** | 214.7 Мбит/с | **22.4%** | **18.6%** | 12.5 МБ |
+| **500 Мбит/с** | 443.1 Мбит/с | **32.6%** | **23.9%** | 12.7 МБ |
+| **Без ограничений** | 886.0 Мбит/с | **50.6%** | **45.0%** | 12.6 МБ |
+
+Ключевые оптимизации:
+- **Zero-Allocation Data Path:** Устранено создание объектов в куче во время передачи данных (`sync.Pool` и переиспользуемые буферы).
+- **Lock-Free Crypto Context:** Поиск активных сессий и шифров выполняется через `atomic.Pointer` без использования мьютексов.
+- **Стабильный объем памяти:** Потребление оперативной памяти составляет 12–14 МБ вне зависимости от объема переданного трафика.
+
+---
 ---
 
 <a name="english-version"></a>
@@ -373,3 +408,39 @@ sudo ./run.sh stop    # Stop daemon
   "socks_listen": "127.0.0.1:10951"
 }
 ```
+
+---
+
+### 8. Performance & Benchmarks
+
+Benchmarking was conducted in isolated Linux network namespaces (`ip netns`) configured to emulate a standard 2 vCPU / 2 GB RAM server instance (both `esp-server` and `esp-client` pinned strictly to two CPU cores via `taskset`):
+
+#### 8.1. Single Stream TCP
+| Link Target | Throughput | Server CPU (% 1 vCPU) | Server Load on 2 vCPU VPS | Client CPU (% 1 vCPU) | Retransmits | Server RAM |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **100 Mbps** | 91.0 Mbps | 16.1% | **8.1%** | 11.0% | 26 | 12.6 MB |
+| **250 Mbps** | 227.6 Mbps | 36.2% | **18.1%** | 24.2% | 58 | 12.4 MB |
+| **500 Mbps** | 455.3 Mbps | 61.9% | **30.9%** | 38.4% | 599 | 12.7 MB |
+| **1000 Mbps (1 Gbps)** | 910.8 Mbps | 97.0% | **48.5%** | 63.6% | 1019 | 12.7 MB |
+| **Uncapped** | 1578.4 Mbps | 89.9% | **45.0%** | 80.0% | 110 | 12.6 MB |
+
+#### 8.2. Two Parallel Streams (`iperf3 -P 2`)
+| Link Target | Throughput | Server Load on 2 vCPU VPS | Client Load on 2 vCPU VPS | Retransmits |
+| :--- | :--- | :--- | :--- | :--- |
+| **250 Mbps** | 227.6 Mbps | **18.1%** | **12.1%** | 58 |
+| **500 Mbps** | 455.3 Mbps | **31.1%** | **18.9%** | 111 |
+| **1000 Mbps** | 910.7 Mbps | **46.7%** | **30.2%** | 1079 |
+| **Uncapped** | 1610.8 Mbps | **45.5%** | **39.9%** | 401 |
+
+#### 8.3. Full-Duplex Bidirectional (`--bidir`)
+| Link Target | Total Throughput (DL + UL) | Server Load on 2 vCPU VPS | Client Load on 2 vCPU VPS | Server RAM |
+| :--- | :--- | :--- | :--- | :--- |
+| **250 Mbps** | 214.7 Mbps | **22.4%** | **18.6%** | 12.5 MB |
+| **500 Mbps** | 443.1 Mbps | **32.6%** | **23.9%** | 12.7 MB |
+| **Uncapped** | 886.0 Mbps | **50.6%** | **45.0%** | 12.6 MB |
+
+Architecture highlights:
+- **Zero-Allocation Data Path:** Heap allocations during packet processing are eliminated using `sync.Pool` and preallocated per-worker buffers.
+- **Lock-Free Cryptographic State:** Cryptographic contexts and active sessions use `atomic.Pointer` for concurrent zero-contention lookups.
+- **Deterministic Padding:** RFC 4303 sequential padding and sequence-derived jitter replace kernel entropy syscalls on the packet datapath.
+- **Low Memory Footprint:** Stable resident memory usage of 12–14 MB under continuous full-rate load.

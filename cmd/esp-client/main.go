@@ -97,8 +97,7 @@ func cleanupClientRouting(tunName, tunIP string) {
 	exec.Command("ip", "route", "del", "default", "dev", tunName, "table", "150").Run()
 }
 
-type SessionStateManager struct {
-	mu               sync.RWMutex
+type clientCryptoState struct {
 	activeSPI        uint32
 	activeCipher     *esp.SessionCipher
 	activeAntiReplay *esp.AntiReplay
@@ -109,43 +108,56 @@ type SessionStateManager struct {
 	prevExpiry     time.Time
 }
 
+type SessionStateManager struct {
+	rotateMu sync.Mutex
+	state    atomic.Pointer[clientCryptoState]
+}
+
 func (s *SessionStateManager) GetActive() (uint32, *esp.SessionCipher) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.activeSPI, s.activeCipher
+	st := s.state.Load()
+	if st == nil {
+		return 0, nil
+	}
+	return st.activeSPI, st.activeCipher
 }
 
 func (s *SessionStateManager) ActiveSPI() uint32 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.activeSPI
+	st := s.state.Load()
+	if st == nil {
+		return 0
+	}
+	return st.activeSPI
 }
 
 func (s *SessionStateManager) Rotate(newSPI uint32, newCipher *esp.SessionCipher) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.rotateMu.Lock()
+	defer s.rotateMu.Unlock()
 
-	if s.activeSPI != 0 && s.activeCipher != nil {
-		s.prevSPI = s.activeSPI
-		s.prevCipher = s.activeCipher
-		s.prevAntiReplay = s.activeAntiReplay
-		s.prevExpiry = time.Now().Add(30 * time.Second)
+	old := s.state.Load()
+	newState := &clientCryptoState{
+		activeSPI:        newSPI,
+		activeCipher:     newCipher,
+		activeAntiReplay: esp.NewAntiReplay(),
 	}
-
-	s.activeSPI = newSPI
-	s.activeCipher = newCipher
-	s.activeAntiReplay = esp.NewAntiReplay()
+	if old != nil && old.activeSPI != 0 && old.activeCipher != nil {
+		newState.prevSPI = old.activeSPI
+		newState.prevCipher = old.activeCipher
+		newState.prevAntiReplay = old.activeAntiReplay
+		newState.prevExpiry = time.Now().Add(30 * time.Second)
+	}
+	s.state.Store(newState)
 }
 
 func (s *SessionStateManager) LookupInbound(spi uint32) (*esp.SessionCipher, *esp.AntiReplay, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if spi == s.activeSPI && s.activeCipher != nil {
-		return s.activeCipher, s.activeAntiReplay, true
+	st := s.state.Load()
+	if st == nil {
+		return nil, nil, false
 	}
-	if spi == s.prevSPI && s.prevCipher != nil && time.Now().Before(s.prevExpiry) {
-		return s.prevCipher, s.prevAntiReplay, true
+	if spi == st.activeSPI && st.activeCipher != nil {
+		return st.activeCipher, st.activeAntiReplay, true
+	}
+	if spi == st.prevSPI && st.prevCipher != nil && time.Now().Before(st.prevExpiry) {
+		return st.prevCipher, st.prevAntiReplay, true
 	}
 	return nil, nil, false
 }
@@ -459,6 +471,10 @@ func main() {
 		log.Fatalf("failed to open raw socket: %v (run with sudo / CAP_NET_RAW)", err)
 	}
 	defer rawConn.Close()
+	if ipConn, ok := rawConn.(*net.IPConn); ok {
+		_ = ipConn.SetReadBuffer(4 * 1024 * 1024)
+		_ = ipConn.SetWriteBuffer(4 * 1024 * 1024)
+	}
 
 	if cfg.BindInterface != "" {
 		rawConnFile, err := rawConn.(*net.IPConn).File()
@@ -478,7 +494,7 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	var tunDev *water.Interface
+	var tunDev atomic.Pointer[water.Interface]
 	var tunMu sync.Mutex
 	var assignedTunIP string
 	handshakeDone := make(chan struct{})
@@ -498,9 +514,9 @@ func main() {
 		cancel()
 		rawConn.Close()
 		tunMu.Lock()
-		if tunDev != nil {
+		if dev := tunDev.Load(); dev != nil {
 			cleanupClientRouting(cfg.TunName, assignedTunIP)
-			tunDev.Close()
+			dev.Close()
 			exec.Command("ip", "link", "del", cfg.TunName).Run()
 		}
 		tunMu.Unlock()
@@ -522,7 +538,7 @@ func main() {
 			return
 		}
 
-		if tunDev != nil {
+		if dev := tunDev.Load(); dev != nil {
 			if assignedTunIP != tunIP {
 				cleanupClientRouting(cfg.TunName, assignedTunIP)
 				if assignedTunIP != "" {
@@ -536,11 +552,10 @@ func main() {
 			return
 		}
 
-		var err error
-		tunDev, err = esp.CreateTun(cfg.TunName)
+		newDev, err := esp.CreateTun(cfg.TunName)
 		if err != nil {
 			exec.Command("ip", "link", "del", cfg.TunName).Run()
-			tunDev, err = esp.CreateTun(cfg.TunName)
+			newDev, err = esp.CreateTun(cfg.TunName)
 			if err != nil {
 				log.Fatalf("failed to create tun device %s: %v", cfg.TunName, err)
 			}
@@ -556,6 +571,7 @@ func main() {
 		}
 
 		setupClientRouting(cfg.TunName, tunIP, gatewayIP)
+		tunDev.Store(newDev)
 		if !cfg.DisableSocks && cfg.SocksListen != "" && cfg.SocksListen != "none" {
 			go startSocksServer(ctx, cfg.SocksListen, getTunIP, cfg.TunName, dnsIP)
 		}
@@ -632,6 +648,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 65535)
+		plainBuf := make([]byte, 65536)
 		for {
 			select {
 			case <-ctx.Done():
@@ -731,27 +748,26 @@ func main() {
 			}
 
 			pktSeq := binary.BigEndian.Uint32(packet[4:8])
-			if !ar.Check(pktSeq) {
+			if !ar.CheckAndUpdate(pktSeq) {
 				continue
 			}
 
-			nextHdr, inner, err := ciph.Unpack(packet)
+			nextHdr, inner, err := ciph.UnpackTo(plainBuf, packet)
 			if err != nil {
 				continue
 			}
 
-			ar.Update(pktSeq)
-			lastServerPacket.Store(time.Now().Unix())
+			nowUnix := time.Now().Unix()
+			if nowUnix != lastServerPacket.Load() {
+				lastServerPacket.Store(nowUnix)
+			}
 
 			if nextHdr == esp.ProtoControl {
 				continue
 			}
 
 			if nextHdr == esp.ProtoIPv4 && len(inner) > 0 {
-				tunMu.Lock()
-				dev := tunDev
-				tunMu.Unlock()
-				if dev != nil {
+				if dev := tunDev.Load(); dev != nil {
 					dev.Write(inner)
 				}
 			}
@@ -767,14 +783,13 @@ func main() {
 		case <-handshakeDone:
 		}
 
-		tunMu.Lock()
-		dev := tunDev
-		tunMu.Unlock()
+		dev := tunDev.Load()
 		if dev == nil {
 			return
 		}
 
 		buf := make([]byte, 65535)
+		packedBuf := make([]byte, 65536)
 		for {
 			select {
 			case <-ctx.Done():
@@ -802,7 +817,7 @@ func main() {
 			}
 
 			pSeq := seq.Add(1)
-			packed, err := ciph.Pack(sSPI, pSeq, esp.ProtoIPv4, buf[:n])
+			packed, err := ciph.PackTo(packedBuf, sSPI, pSeq, esp.ProtoIPv4, buf[:n])
 			if err != nil {
 				continue
 			}
@@ -829,9 +844,9 @@ func main() {
 	wg.Wait()
 
 	tunMu.Lock()
-	if tunDev != nil {
+	if dev := tunDev.Load(); dev != nil {
 		cleanupClientRouting(cfg.TunName, assignedTunIP)
-		tunDev.Close()
+		dev.Close()
 		exec.Command("ip", "link", "del", cfg.TunName).Run()
 	}
 	tunMu.Unlock()

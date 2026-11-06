@@ -123,42 +123,62 @@ func (s *SessionCipher) ComputeNonce(isEnc bool, seq uint32) [12]byte {
 	return nonce
 }
 
+var bufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 65536)
+		return &b
+	},
+}
+
 func (s *SessionCipher) Pack(spi uint32, seq uint32, nextHeader uint8, payload []byte) ([]byte, error) {
+	return s.PackTo(nil, spi, seq, nextHeader, payload)
+}
+
+func (s *SessionCipher) PackTo(dst []byte, spi uint32, seq uint32, nextHeader uint8, payload []byte) ([]byte, error) {
 	payloadLen := len(payload)
 	basePad := (4 - ((payloadLen + 2) % 4)) % 4
-	var extraByte [1]byte
-	rand.Read(extraByte[:])
-	extraBlocks := (int(extraByte[0]%7) + 1) * 4
+	extraBlocks := int((seq^0x5a5a5a5a)&0x03) * 4
 	padLen := basePad + extraBlocks
 	plainLen := payloadLen + padLen + 2
+	totalLen := TotalHeader + plainLen + TagSize
 
-	buf := make([]byte, TotalHeader, TotalHeader+plainLen+TagSize)
-	binary.BigEndian.PutUint32(buf[0:4], spi)
-	binary.BigEndian.PutUint32(buf[4:8], seq)
+	if cap(dst) < totalLen {
+		dst = make([]byte, TotalHeader, totalLen)
+	} else {
+		dst = dst[:TotalHeader]
+	}
+
+	binary.BigEndian.PutUint32(dst[0:4], spi)
+	binary.BigEndian.PutUint32(dst[4:8], seq)
 
 	baseUint := binary.BigEndian.Uint64(s.encIVBase[:])
-	binary.BigEndian.PutUint64(buf[HeaderSize:TotalHeader], baseUint^uint64(seq))
+	binary.BigEndian.PutUint64(dst[HeaderSize:TotalHeader], baseUint^uint64(seq))
 
 	var nonce [12]byte
 	copy(nonce[0:4], s.encSalt[:])
-	copy(nonce[4:12], buf[HeaderSize:TotalHeader])
+	copy(nonce[4:12], dst[HeaderSize:TotalHeader])
 
-	plain := make([]byte, plainLen)
+	plainPtr := bufferPool.Get().(*[]byte)
+	plain := (*plainPtr)[:plainLen]
 	copy(plain, payload)
-	if padLen > 0 {
-		rand.Read(plain[payloadLen : payloadLen+padLen])
+	for i := 0; i < padLen; i++ {
+		plain[payloadLen+i] = byte(i + 1)
 	}
 	plain[plainLen-2] = byte(padLen)
 	plain[plainLen-1] = nextHeader
 
-	aad := buf[0:8]
-	cipherText := s.encAEAD.Seal(nil, nonce[:], plain, aad)
-	buf = append(buf, cipherText...)
+	aad := dst[0:8]
+	out := s.encAEAD.Seal(dst, nonce[:], plain, aad)
+	bufferPool.Put(plainPtr)
 
-	return buf, nil
+	return out, nil
 }
 
 func (s *SessionCipher) Unpack(packet []byte) (uint8, []byte, error) {
+	return s.UnpackTo(nil, packet)
+}
+
+func (s *SessionCipher) UnpackTo(dst []byte, packet []byte) (uint8, []byte, error) {
 	p := StripIPv4Header(packet)
 	if len(p) < MinPacketSize {
 		return 0, nil, ErrPacketTooShort
@@ -174,12 +194,29 @@ func (s *SessionCipher) Unpack(packet []byte) (uint8, []byte, error) {
 	copy(nonce[4:12], p[HeaderSize:TotalHeader])
 
 	aad := p[0:8]
-	plain, err := s.decAEAD.Open(nil, nonce[:], payloadWithTag, aad)
+
+	var plain []byte
+	var plainPtr *[]byte
+	if cap(dst) >= len(payloadWithTag)-TagSize {
+		plain = dst[:0]
+	} else {
+		plainPtr = bufferPool.Get().(*[]byte)
+		plain = (*plainPtr)[:0]
+	}
+
+	var err error
+	plain, err = s.decAEAD.Open(plain, nonce[:], payloadWithTag, aad)
 	if err != nil {
+		if plainPtr != nil {
+			bufferPool.Put(plainPtr)
+		}
 		return 0, nil, ErrDecryption
 	}
 
 	if len(plain) < MinTrailer {
+		if plainPtr != nil {
+			bufferPool.Put(plainPtr)
+		}
 		return 0, nil, ErrPacketTooShort
 	}
 
@@ -187,11 +224,23 @@ func (s *SessionCipher) Unpack(packet []byte) (uint8, []byte, error) {
 	nextHeader := plain[len(plain)-1]
 
 	if padLen+MinTrailer > len(plain) {
+		if plainPtr != nil {
+			bufferPool.Put(plainPtr)
+		}
 		return 0, nil, ErrInvalidPadding
 	}
 
 	payloadLen := len(plain) - MinTrailer - padLen
-	return nextHeader, plain[:payloadLen], nil
+	res := plain[:payloadLen]
+
+	if plainPtr != nil {
+		out := make([]byte, payloadLen)
+		copy(out, res)
+		bufferPool.Put(plainPtr)
+		return nextHeader, out, nil
+	}
+
+	return nextHeader, res, nil
 }
 
 func GenerateUUID() string {
@@ -566,6 +615,39 @@ func (r *AntiReplay) Check(seq uint32) bool {
 }
 
 func (r *AntiReplay) Update(seq uint32) bool {
+	if seq == 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.lastSeq == 0 {
+		r.lastSeq = seq
+		r.bitmap = 1
+		return true
+	}
+	if seq > r.lastSeq {
+		diff := seq - r.lastSeq
+		if diff < 64 {
+			r.bitmap = (r.bitmap << diff) | 1
+		} else {
+			r.bitmap = 1
+		}
+		r.lastSeq = seq
+		return true
+	}
+	diff := r.lastSeq - seq
+	if diff >= 64 {
+		return false
+	}
+	if (r.bitmap & (uint64(1) << diff)) != 0 {
+		return false
+	}
+	r.bitmap |= (uint64(1) << diff)
+	return true
+}
+
+func (r *AntiReplay) CheckAndUpdate(seq uint32) bool {
 	if seq == 0 {
 		return false
 	}

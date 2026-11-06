@@ -46,6 +46,16 @@ type ClientEntry struct {
 	UUID string `json:"uuid"`
 }
 
+type SessionCryptoState struct {
+	SessionSPI     uint32
+	Cipher         *esp.SessionCipher
+	AntiReplay     *esp.AntiReplay
+	PrevSessionSPI uint32
+	PrevCipher     *esp.SessionCipher
+	PrevAntiReplay *esp.AntiReplay
+	PrevExpiry     time.Time
+}
+
 type ClientSession struct {
 	Name                    string
 	UUID                    string
@@ -56,15 +66,7 @@ type ClientSession struct {
 	LastArrivalServerNano   int64
 	RateLimitMu             sync.Mutex
 
-	SessionSPIMu   sync.RWMutex
-	SessionSPI     uint32
-	Cipher         *esp.SessionCipher
-	AntiReplay     *esp.AntiReplay
-
-	PrevSessionSPI uint32
-	PrevCipher     *esp.SessionCipher
-	PrevAntiReplay *esp.AntiReplay
-	PrevExpiry     time.Time
+	CryptoState atomic.Pointer[SessionCryptoState]
 
 	CurrentIP   atomic.Pointer[net.IP]
 	CurrentIP32 atomic.Uint32
@@ -515,6 +517,10 @@ func main() {
 		log.Fatalf("failed to open raw esp socket: %v", err)
 	}
 	defer rawConn.Close()
+	if ipConn, ok := rawConn.(*net.IPConn); ok {
+		_ = ipConn.SetReadBuffer(4 * 1024 * 1024)
+		_ = ipConn.SetWriteBuffer(4 * 1024 * 1024)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sigChan := make(chan os.Signal, 1)
@@ -541,15 +547,16 @@ func main() {
 				nowUnix := now.Unix()
 				sessionsBySessionSPIMu.Lock()
 				for sSPI, session := range sessionsBySessionSPI {
-					session.SessionSPIMu.Lock()
-					if session.PrevSessionSPI != 0 && now.After(session.PrevExpiry) {
-						prevSPI := session.PrevSessionSPI
-						session.PrevSessionSPI = 0
-						session.PrevCipher = nil
-						session.PrevAntiReplay = nil
+					crypto := session.CryptoState.Load()
+					if crypto != nil && crypto.PrevSessionSPI != 0 && now.After(crypto.PrevExpiry) {
+						prevSPI := crypto.PrevSessionSPI
+						newCrypto := *crypto
+						newCrypto.PrevSessionSPI = 0
+						newCrypto.PrevCipher = nil
+						newCrypto.PrevAntiReplay = nil
+						session.CryptoState.Store(&newCrypto)
 						delete(sessionsBySessionSPI, prevSPI)
 					}
-					session.SessionSPIMu.Unlock()
 
 					last := session.LastSeen.Load()
 					if last > 0 && nowUnix-last > 600 {
@@ -558,22 +565,14 @@ func main() {
 							ipU32 := session.CurrentIP32.Swap(0)
 							session.CurrentIP.Store(nil)
 
-							session.SessionSPIMu.Lock()
-							activeSPI := session.SessionSPI
-							prevSPI := session.PrevSessionSPI
-							session.SessionSPI = 0
-							session.Cipher = nil
-							session.AntiReplay = nil
-							session.PrevSessionSPI = 0
-							session.PrevCipher = nil
-							session.PrevAntiReplay = nil
-							session.SessionSPIMu.Unlock()
-
-							if activeSPI != 0 {
-								delete(sessionsBySessionSPI, activeSPI)
-							}
-							if prevSPI != 0 {
-								delete(sessionsBySessionSPI, prevSPI)
+							oldCrypto := session.CryptoState.Swap(nil)
+							if oldCrypto != nil {
+								if oldCrypto.SessionSPI != 0 {
+									delete(sessionsBySessionSPI, oldCrypto.SessionSPI)
+								}
+								if oldCrypto.PrevSessionSPI != 0 {
+									delete(sessionsBySessionSPI, oldCrypto.PrevSessionSPI)
+								}
 							}
 							ipPool.Release(session)
 
@@ -597,6 +596,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 65535)
+		plainBuf := make([]byte, 65536)
 		for {
 			select {
 			case <-ctx.Done():
@@ -699,28 +699,27 @@ func main() {
 					}
 				}
 
-				session.SessionSPIMu.Lock()
-				oldSessionSPI := session.SessionSPI
-				oldCipher := session.Cipher
-				oldAR := session.AntiReplay
-
-				if oldSessionSPI != 0 && oldCipher != nil && oldAR != nil {
-					if session.PrevSessionSPI != 0 && session.PrevSessionSPI != oldSessionSPI {
-						oldToClean = session.PrevSessionSPI
-					}
-					session.PrevSessionSPI = oldSessionSPI
-					session.PrevCipher = oldCipher
-					session.PrevAntiReplay = oldAR
-					session.PrevExpiry = time.Now().Add(30 * time.Second)
+				oldCrypto := session.CryptoState.Load()
+				newCrypto := &SessionCryptoState{
+					SessionSPI: newSessionSPI,
+					Cipher:     serverCipher,
+					AntiReplay: esp.NewAntiReplay(),
 				}
 
-				session.SessionSPI = newSessionSPI
-				session.Cipher = serverCipher
-				session.AntiReplay = esp.NewAntiReplay()
+				if oldCrypto != nil && oldCrypto.SessionSPI != 0 {
+					if oldCrypto.PrevSessionSPI != 0 && oldCrypto.PrevSessionSPI != oldCrypto.SessionSPI {
+						oldToClean = oldCrypto.PrevSessionSPI
+					}
+					newCrypto.PrevSessionSPI = oldCrypto.SessionSPI
+					newCrypto.PrevCipher = oldCrypto.Cipher
+					newCrypto.PrevAntiReplay = oldCrypto.AntiReplay
+					newCrypto.PrevExpiry = time.Now().Add(30 * time.Second)
+				}
+
+				session.CryptoState.Store(newCrypto)
 				session.Seq.Store(0)
 				session.RemoteAddr.Store(&from)
 				session.LastSeen.Store(time.Now().Unix())
-				session.SessionSPIMu.Unlock()
 
 				if oldToClean != 0 {
 					delete(sessionsBySessionSPI, oldToClean)
@@ -755,39 +754,42 @@ func main() {
 
 			seq := binary.BigEndian.Uint32(packet[4:8])
 
-			session.SessionSPIMu.RLock()
+			crypto := session.CryptoState.Load()
+			if crypto == nil {
+				continue
+			}
 			var ciph *esp.SessionCipher
 			var ar *esp.AntiReplay
 			var matchedSPI uint32
 			now := time.Now()
 
-			if spi == session.SessionSPI && session.Cipher != nil {
-				ciph = session.Cipher
-				ar = session.AntiReplay
-				matchedSPI = session.SessionSPI
-			} else if spi == session.PrevSessionSPI && session.PrevCipher != nil && now.Before(session.PrevExpiry) {
-				ciph = session.PrevCipher
-				ar = session.PrevAntiReplay
-				matchedSPI = session.PrevSessionSPI
+			if spi == crypto.SessionSPI && crypto.Cipher != nil {
+				ciph = crypto.Cipher
+				ar = crypto.AntiReplay
+				matchedSPI = crypto.SessionSPI
+			} else if spi == crypto.PrevSessionSPI && crypto.PrevCipher != nil && now.Before(crypto.PrevExpiry) {
+				ciph = crypto.PrevCipher
+				ar = crypto.PrevAntiReplay
+				matchedSPI = crypto.PrevSessionSPI
 			}
-			session.SessionSPIMu.RUnlock()
 
 			if ciph == nil || ar == nil {
 				continue
 			}
 
-			if !ar.Check(seq) {
+			if !ar.CheckAndUpdate(seq) {
 				continue
 			}
 
-			nextHdr, inner, err := ciph.Unpack(packet)
+			nextHdr, inner, err := ciph.UnpackTo(plainBuf, packet)
 			if err != nil {
 				continue
 			}
 
-			ar.Update(seq)
-			session.RemoteAddr.Store(&from)
-			session.LastSeen.Store(time.Now().Unix())
+			nowUnix := now.Unix()
+			if nowUnix != session.LastSeen.Load() {
+				session.LastSeen.Store(nowUnix)
+			}
 
 			if nextHdr == esp.ProtoControl {
 				if len(inner) > 0 && inner[0] == esp.ControlKeepalive {
@@ -834,6 +836,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			buf := make([]byte, 65535)
+			packedBuf := make([]byte, 65536)
 			for {
 				select {
 				case <-ctx.Done():
@@ -875,17 +878,15 @@ func main() {
 					continue
 				}
 
-				session.SessionSPIMu.RLock()
-				ciph := session.Cipher
-				sSPI := session.SessionSPI
-				session.SessionSPIMu.RUnlock()
-
-				if ciph == nil || sSPI == 0 {
+				crypto := session.CryptoState.Load()
+				if crypto == nil || crypto.Cipher == nil || crypto.SessionSPI == 0 {
 					continue
 				}
+				ciph := crypto.Cipher
+				sSPI := crypto.SessionSPI
 
 				seq := session.Seq.Add(1)
-				packed, err := ciph.Pack(sSPI, seq, esp.ProtoIPv4, buf[:n])
+				packed, err := ciph.PackTo(packedBuf, sSPI, seq, esp.ProtoIPv4, buf[:n])
 				if err != nil {
 					continue
 				}
