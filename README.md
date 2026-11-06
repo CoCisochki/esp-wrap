@@ -122,7 +122,7 @@ sudo ./esp-server -c server.json -no-tun
 
 #### 6.2. Сборка из исходников
 ```bash
-git clone https://github.com/username/esp-wrap.git
+git clone https://github.com/CoCisochki/esp-wrap.git
 cd esp-wrap
 
 make test   # Запуск тестов
@@ -311,7 +311,7 @@ Client configuration bundles are saved to `generated_clients/198.51.100.1/`.
 
 #### 6.2. Manual Build
 ```bash
-git clone https://github.com/username/esp-wrap.git
+git clone https://github.com/CoCisochki/esp-wrap.git
 cd esp-wrap
 
 make test   # Execute test suite
