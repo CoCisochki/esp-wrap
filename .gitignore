@@ -1,0 +1,30 @@
+# Binaries and build artifacts
+bin/
+dist/
+*.exe
+*.dll
+# Root binaries
+/esp-server
+/esp-client
+
+# Client packages and live configurations
+generated_clients/
+server.json
+client.json
+client_*.json
+*.tar.gz
+
+# Runtime logs and PID files
+*.log
+*.pid
+
+# Environment files
+*.env
+.env.*
+
+# OS and IDE files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

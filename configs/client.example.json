@@ -1,0 +1,12 @@
+{
+  "server_addr": "198.51.100.1",
+  "server_public_key": "EXAMPLE_SERVER_PUBLIC_KEY_BASE64_PLACEHOLDER=",
+  "uuid": "c3b5d2e1-4a6f-4c8d-9e0a-1b2c3d4e5f60",
+  "bind_interface": "",
+  "gateway": "10.99.0.1",
+  "tun_name": "tun-esp0",
+  "tun_mtu": 1360,
+  "disable_tun": false,
+  "keepalive_seconds": 25,
+  "socks_listen": "127.0.0.1:10951"
+}
