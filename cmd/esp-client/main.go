@@ -97,21 +97,57 @@ func cleanupClientRouting(tunName, tunIP string) {
 	exec.Command("ip", "route", "del", "default", "dev", tunName, "table", "150").Run()
 }
 
-type ClientCipherState struct {
-	mu     sync.RWMutex
-	cipher *esp.SessionCipher
+type SessionStateManager struct {
+	mu               sync.RWMutex
+	activeSPI        uint32
+	activeCipher     *esp.SessionCipher
+	activeAntiReplay *esp.AntiReplay
+
+	prevSPI        uint32
+	prevCipher     *esp.SessionCipher
+	prevAntiReplay *esp.AntiReplay
+	prevExpiry     time.Time
 }
 
-func (s *ClientCipherState) Get() *esp.SessionCipher {
+func (s *SessionStateManager) GetActive() (uint32, *esp.SessionCipher) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.cipher
+	return s.activeSPI, s.activeCipher
 }
 
-func (s *ClientCipherState) Set(c *esp.SessionCipher) {
+func (s *SessionStateManager) ActiveSPI() uint32 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.activeSPI
+}
+
+func (s *SessionStateManager) Rotate(newSPI uint32, newCipher *esp.SessionCipher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cipher = c
+
+	if s.activeSPI != 0 && s.activeCipher != nil {
+		s.prevSPI = s.activeSPI
+		s.prevCipher = s.activeCipher
+		s.prevAntiReplay = s.activeAntiReplay
+		s.prevExpiry = time.Now().Add(30 * time.Second)
+	}
+
+	s.activeSPI = newSPI
+	s.activeCipher = newCipher
+	s.activeAntiReplay = esp.NewAntiReplay()
+}
+
+func (s *SessionStateManager) LookupInbound(spi uint32) (*esp.SessionCipher, *esp.AntiReplay, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if spi == s.activeSPI && s.activeCipher != nil {
+		return s.activeCipher, s.activeAntiReplay, true
+	}
+	if spi == s.prevSPI && s.prevCipher != nil && time.Now().Before(s.prevExpiry) {
+		return s.prevCipher, s.prevAntiReplay, true
+	}
+	return nil, nil, false
 }
 
 func handleSocksClient(ctx context.Context, clientConn net.Conn, socksListen string, getTunIP func() string, tunName, dnsIP string) {
@@ -198,7 +234,7 @@ func handleSocksClient(ctx context.Context, clientConn net.Conn, socksListen str
 		Timeout:   10 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
-				syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, tunName)
+				bindToDevice(fd, tunName)
 			})
 		},
 		Resolver: &net.Resolver{
@@ -209,7 +245,7 @@ func handleSocksClient(ctx context.Context, clientConn net.Conn, socksListen str
 					Timeout:   5 * time.Second,
 					Control: func(network, address string, c syscall.RawConn) error {
 						return c.Control(func(fd uintptr) {
-							syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, tunName)
+							bindToDevice(fd, tunName)
 						})
 					},
 				}
@@ -427,8 +463,8 @@ func main() {
 	if cfg.BindInterface != "" {
 		rawConnFile, err := rawConn.(*net.IPConn).File()
 		if err == nil {
-			fd := int(rawConnFile.Fd())
-			_ = syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, cfg.BindInterface)
+			fd := rawConnFile.Fd()
+			_ = bindToDevice(fd, cfg.BindInterface)
 			rawConnFile.Close()
 		}
 	}
@@ -448,12 +484,10 @@ func main() {
 	handshakeDone := make(chan struct{})
 	var handshakeOnce sync.Once
 	var lastServerPacket atomic.Int64
-	var activeSessionSPI atomic.Uint32
 	var seq atomic.Uint32
 	var lastRekeyTime atomic.Int64
 
-	antiReplay := esp.NewAntiReplay()
-	cipherState := &ClientCipherState{}
+	sessionState := &SessionStateManager{}
 
 	var currentEphPrivMu sync.RWMutex
 	var currentEphPriv *ecdh.PrivateKey
@@ -503,20 +537,10 @@ func main() {
 		}
 
 		var err error
-		tunDev, err = water.New(water.Config{
-			DeviceType: water.TUN,
-			PlatformSpecificParams: water.PlatformSpecificParams{
-				Name: cfg.TunName,
-			},
-		})
+		tunDev, err = esp.CreateTun(cfg.TunName)
 		if err != nil {
 			exec.Command("ip", "link", "del", cfg.TunName).Run()
-			tunDev, err = water.New(water.Config{
-				DeviceType: water.TUN,
-				PlatformSpecificParams: water.PlatformSpecificParams{
-					Name: cfg.TunName,
-				},
-			})
+			tunDev, err = esp.CreateTun(cfg.TunName)
 			if err != nil {
 				log.Fatalf("failed to create tun device %s: %v", cfg.TunName, err)
 			}
@@ -569,11 +593,11 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-handshakeTicker.C:
-				if activeSessionSPI.Load() == 0 {
+				if sessionState.ActiveSPI() == 0 {
 					sendHandshake()
 				}
 			case <-ticker.C:
-				sSPI := activeSessionSPI.Load()
+				sSPI, ciph := sessionState.GetActive()
 				if sSPI != 0 {
 					now := time.Now().Unix()
 					last := lastServerPacket.Load()
@@ -592,7 +616,6 @@ func main() {
 						continue
 					}
 
-					ciph := cipherState.Get()
 					if ciph != nil {
 						pSeq := seq.Add(1)
 						packed, err := ciph.Pack(sSPI, pSeq, esp.ProtoControl, []byte{esp.ControlKeepalive})
@@ -681,8 +704,7 @@ func main() {
 					continue
 				}
 
-				activeSessionSPI.Store(resp.SessionSPI)
-				cipherState.Set(clientCipher)
+				sessionState.Rotate(resp.SessionSPI, clientCipher)
 				seq.Store(0)
 				lastRekeyTime.Store(time.Now().Unix())
 				lastServerPacket.Store(time.Now().Unix())
@@ -699,8 +721,8 @@ func main() {
 				continue
 			}
 
-			sSPI := activeSessionSPI.Load()
-			if sSPI == 0 || packetSPI != sSPI {
+			ciph, ar, ok := sessionState.LookupInbound(packetSPI)
+			if !ok {
 				continue
 			}
 
@@ -709,12 +731,7 @@ func main() {
 			}
 
 			pktSeq := binary.BigEndian.Uint32(packet[4:8])
-			if !antiReplay.Check(pktSeq) {
-				continue
-			}
-
-			ciph := cipherState.Get()
-			if ciph == nil {
+			if !ar.Check(pktSeq) {
 				continue
 			}
 
@@ -723,7 +740,7 @@ func main() {
 				continue
 			}
 
-			antiReplay.Update(pktSeq)
+			ar.Update(pktSeq)
 			lastServerPacket.Store(time.Now().Unix())
 
 			if nextHdr == esp.ProtoControl {
@@ -779,8 +796,7 @@ func main() {
 				continue
 			}
 
-			ciph := cipherState.Get()
-			sSPI := activeSessionSPI.Load()
+			sSPI, ciph := sessionState.GetActive()
 			if ciph == nil || sSPI == 0 {
 				continue
 			}

@@ -47,18 +47,24 @@ type ClientEntry struct {
 }
 
 type ClientSession struct {
-	Name              string
-	UUID              string
-	UUIDBytes         [16]byte
-	AuthSPI           uint32
-	Mac1Key           [32]byte
-	LastHandshakeNano int64
-	RateLimitMu       sync.Mutex
+	Name                    string
+	UUID                    string
+	UUIDBytes               [16]byte
+	AuthSPI                 uint32
+	Mac1Key                 [32]byte
+	LastClientHandshakeNano int64
+	LastArrivalServerNano   int64
+	RateLimitMu             sync.Mutex
 
-	SessionSPIMu sync.RWMutex
-	SessionSPI   uint32
-	Cipher       *esp.SessionCipher
-	AntiReplay   *esp.AntiReplay
+	SessionSPIMu   sync.RWMutex
+	SessionSPI     uint32
+	Cipher         *esp.SessionCipher
+	AntiReplay     *esp.AntiReplay
+
+	PrevSessionSPI uint32
+	PrevCipher     *esp.SessionCipher
+	PrevAntiReplay *esp.AntiReplay
+	PrevExpiry     time.Time
 
 	CurrentIP   atomic.Pointer[net.IP]
 	CurrentIP32 atomic.Uint32
@@ -473,20 +479,10 @@ func main() {
 	cidrStr := fmt.Sprintf("%s/%d", cfg.TunIP, cfg.TunCIDR)
 	if !cfg.DisableTun {
 		var err error
-		tun, err = water.New(water.Config{
-			DeviceType: water.TUN,
-			PlatformSpecificParams: water.PlatformSpecificParams{
-				Name: cfg.TunName,
-			},
-		})
+		tun, err = esp.CreateTun(cfg.TunName)
 		if err != nil {
 			exec.Command("ip", "link", "del", cfg.TunName).Run()
-			tun, err = water.New(water.Config{
-				DeviceType: water.TUN,
-				PlatformSpecificParams: water.PlatformSpecificParams{
-					Name: cfg.TunName,
-				},
-			})
+			tun, err = esp.CreateTun(cfg.TunName)
 			if err != nil {
 				log.Fatalf("failed to create tun device %s: %v", cfg.TunName, err)
 			}
@@ -532,22 +528,44 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				now := time.Now().Unix()
+				now := time.Now()
+				nowUnix := now.Unix()
 				sessionsBySessionSPIMu.Lock()
 				for sSPI, session := range sessionsBySessionSPI {
+					session.SessionSPIMu.Lock()
+					if session.PrevSessionSPI != 0 && now.After(session.PrevExpiry) {
+						prevSPI := session.PrevSessionSPI
+						session.PrevSessionSPI = 0
+						session.PrevCipher = nil
+						session.PrevAntiReplay = nil
+						delete(sessionsBySessionSPI, prevSPI)
+					}
+					session.SessionSPIMu.Unlock()
+
 					last := session.LastSeen.Load()
-					if last > 0 && now-last > 600 {
+					if last > 0 && nowUnix-last > 600 {
 						currIP := session.CurrentIP.Load()
 						if currIP != nil {
 							ipU32 := session.CurrentIP32.Swap(0)
 							session.CurrentIP.Store(nil)
 
 							session.SessionSPIMu.Lock()
+							activeSPI := session.SessionSPI
+							prevSPI := session.PrevSessionSPI
 							session.SessionSPI = 0
 							session.Cipher = nil
+							session.AntiReplay = nil
+							session.PrevSessionSPI = 0
+							session.PrevCipher = nil
+							session.PrevAntiReplay = nil
 							session.SessionSPIMu.Unlock()
 
-							delete(sessionsBySessionSPI, sSPI)
+							if activeSPI != 0 {
+								delete(sessionsBySessionSPI, activeSPI)
+							}
+							if prevSPI != 0 {
+								delete(sessionsBySessionSPI, prevSPI)
+							}
 							ipPool.Release(session)
 
 							clientsByTunIPMu.Lock()
@@ -602,7 +620,7 @@ func main() {
 			}
 
 			if session, isAuth := clientsByAuthSPI[spi]; isAuth {
-				clientEphPubBytes, _, err := esp.UnpackHandshakeReq(packet, session.Mac1Key, &session.LastHandshakeNano, &session.RateLimitMu)
+				clientEphPubBytes, _, err := esp.UnpackHandshakeReq(packet, session.Mac1Key, &session.LastClientHandshakeNano, &session.LastArrivalServerNano, &session.RateLimitMu)
 				if err != nil {
 					continue
 				}
@@ -628,20 +646,6 @@ func main() {
 					continue
 				}
 
-				var newSessionSPI uint32
-				sessionsBySessionSPIMu.Lock()
-				for {
-					s, err := esp.GenerateSessionSPI()
-					if err == nil {
-						if _, exists := sessionsBySessionSPI[s]; !exists {
-							if _, isAuthSPI := clientsByAuthSPI[s]; !isAuthSPI {
-								newSessionSPI = s
-								break
-							}
-						}
-					}
-				}
-
 				_, serverCipher, err := esp.DeriveSessionCiphers(
 					staticDH,
 					ephemeralDH,
@@ -651,7 +655,6 @@ func main() {
 					session.UUIDBytes,
 				)
 				if err != nil {
-					sessionsBySessionSPIMu.Unlock()
 					continue
 				}
 
@@ -659,7 +662,6 @@ func main() {
 				if currIP == nil {
 					allocatedIP, err := ipPool.AllocateRandom(session)
 					if err != nil {
-						sessionsBySessionSPIMu.Unlock()
 						log.Printf("ip pool allocation error for %s: %v", session.Name, err)
 						continue
 					}
@@ -673,8 +675,36 @@ func main() {
 					currIP = &allocatedIP
 				}
 
+				var newSessionSPI uint32
+				var oldToClean uint32
+				sessionsBySessionSPIMu.Lock()
+				for {
+					s, err := esp.GenerateSessionSPI()
+					if err == nil {
+						if _, exists := sessionsBySessionSPI[s]; !exists {
+							if _, isAuthSPI := clientsByAuthSPI[s]; !isAuthSPI {
+								newSessionSPI = s
+								break
+							}
+						}
+					}
+				}
+
 				session.SessionSPIMu.Lock()
 				oldSessionSPI := session.SessionSPI
+				oldCipher := session.Cipher
+				oldAR := session.AntiReplay
+
+				if oldSessionSPI != 0 && oldCipher != nil && oldAR != nil {
+					if session.PrevSessionSPI != 0 && session.PrevSessionSPI != oldSessionSPI {
+						oldToClean = session.PrevSessionSPI
+					}
+					session.PrevSessionSPI = oldSessionSPI
+					session.PrevCipher = oldCipher
+					session.PrevAntiReplay = oldAR
+					session.PrevExpiry = time.Now().Add(30 * time.Second)
+				}
+
 				session.SessionSPI = newSessionSPI
 				session.Cipher = serverCipher
 				session.AntiReplay = esp.NewAntiReplay()
@@ -683,8 +713,8 @@ func main() {
 				session.LastSeen.Store(time.Now().Unix())
 				session.SessionSPIMu.Unlock()
 
-				if oldSessionSPI != 0 {
-					delete(sessionsBySessionSPI, oldSessionSPI)
+				if oldToClean != 0 {
+					delete(sessionsBySessionSPI, oldToClean)
 				}
 				sessionsBySessionSPI[newSessionSPI] = session
 				sessionsBySessionSPIMu.Unlock()
@@ -717,12 +747,23 @@ func main() {
 			seq := binary.BigEndian.Uint32(packet[4:8])
 
 			session.SessionSPIMu.RLock()
-			ciph := session.Cipher
-			sSPI := session.SessionSPI
-			ar := session.AntiReplay
+			var ciph *esp.SessionCipher
+			var ar *esp.AntiReplay
+			var matchedSPI uint32
+			now := time.Now()
+
+			if spi == session.SessionSPI && session.Cipher != nil {
+				ciph = session.Cipher
+				ar = session.AntiReplay
+				matchedSPI = session.SessionSPI
+			} else if spi == session.PrevSessionSPI && session.PrevCipher != nil && now.Before(session.PrevExpiry) {
+				ciph = session.PrevCipher
+				ar = session.PrevAntiReplay
+				matchedSPI = session.PrevSessionSPI
+			}
 			session.SessionSPIMu.RUnlock()
 
-			if ciph == nil || sSPI != spi || ar == nil {
+			if ciph == nil || ar == nil {
 				continue
 			}
 
@@ -742,7 +783,7 @@ func main() {
 			if nextHdr == esp.ProtoControl {
 				if len(inner) > 0 && inner[0] == esp.ControlKeepalive {
 					ackSeq := session.Seq.Add(1)
-					packedAck, err := ciph.Pack(sSPI, ackSeq, esp.ProtoControl, []byte{esp.ControlKeepalive})
+					packedAck, err := ciph.Pack(matchedSPI, ackSeq, esp.ProtoControl, []byte{esp.ControlKeepalive})
 					if err == nil {
 						rawConn.WriteTo(packedAck, from)
 					}

@@ -325,7 +325,7 @@ func PackHandshakeReq(authSPI uint32, clientEphemeralPub []byte, mac1Key [32]byt
 	return buf, nowNano, nil
 }
 
-func UnpackHandshakeReq(packet []byte, mac1Key [32]byte, lastHandshakeNano *int64, rateLimitMu *sync.Mutex) (clientEphemeralPub []byte, timestampNano int64, err error) {
+func UnpackHandshakeReq(packet []byte, mac1Key [32]byte, lastClientNano *int64, lastArrivalNano *int64, rateLimitMu *sync.Mutex) (clientEphemeralPub []byte, timestampNano int64, err error) {
 	p := StripIPv4Header(packet)
 	if len(p) < HandshakeReqMinLen {
 		return nil, 0, ErrPacketTooShort
@@ -344,9 +344,9 @@ func UnpackHandshakeReq(packet []byte, mac1Key [32]byte, lastHandshakeNano *int6
 	}
 
 	pktNano := int64(binary.BigEndian.Uint64(p[36:44]))
-	nowNano := time.Now().UnixNano()
-	diff := nowNano - pktNano
-	if diff < -60*int64(time.Second) || diff > 60*int64(time.Second) {
+	serverNowNano := time.Now().UnixNano()
+	diff := serverNowNano - pktNano
+	if diff < -300*int64(time.Second) || diff > 300*int64(time.Second) {
 		return nil, 0, ErrTimestampStale
 	}
 
@@ -355,14 +355,23 @@ func UnpackHandshakeReq(packet []byte, mac1Key [32]byte, lastHandshakeNano *int6
 		defer rateLimitMu.Unlock()
 	}
 
-	if lastHandshakeNano != nil {
-		if pktNano <= *lastHandshakeNano {
-			return nil, 0, ErrReplayDetected
-		}
-		if nowNano-*lastHandshakeNano < int64(1*time.Second) {
+	if lastArrivalNano != nil {
+		if *lastArrivalNano > 0 && (serverNowNano-*lastArrivalNano) < int64(1*time.Second) {
 			return nil, 0, ErrRateLimited
 		}
-		*lastHandshakeNano = pktNano
+	}
+
+	if lastClientNano != nil {
+		if *lastClientNano > 0 && pktNano <= *lastClientNano {
+			return nil, 0, ErrReplayDetected
+		}
+	}
+
+	if lastArrivalNano != nil {
+		*lastArrivalNano = serverNowNano
+	}
+	if lastClientNano != nil {
+		*lastClientNano = pktNano
 	}
 
 	pub := make([]byte, 32)

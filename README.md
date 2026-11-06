@@ -13,7 +13,7 @@ Userspace Layer 3 Tunnel over Raw IP Protocol 50 (ESP)
 `esp-wrap` — легковесный сетевой L3-туннель, работающий в пространстве пользователя (Userspace) на языке Go непосредственно поверх сырых IP-пакетов протокола ESP (Encapsulating Security Payload, IP Protocol 50, RFC 4303).
 
 Основное назначение:
-1. **Серверные мосты (Relay VPS <-> Exit VPS):** Соединение промежуточного сервера в РФ с зарубежным сервером, на котором заблокированы все входящие TCP/UDP протоколы. Скорость передачи достигает 300-500 Мбит/с без потерь пакетов.
+1. **Серверные мосты (Relay VPS <-> Exit VPS):** Соединение промежуточного сервера в РФ с зарубежным сервером, на котором заблокированы входящие TCP/UDP протоколы, без потерь пакетов.
 2. **Прямое клиентское подключение:** Подключение с рабочих станций или домашних роутеров при наличии публичного («белого») статического или динамического IPv4-адреса.
 
 ---
@@ -200,7 +200,7 @@ sudo ./run.sh stop    # Остановка сервиса
 `esp-wrap` is a lightweight, userspace Layer 3 network tunnel written in Go that encapsulates traffic directly inside raw IP Encapsulating Security Payload packets (ESP, IP Protocol 50, RFC 4303).
 
 Primary use cases:
-1. **Server-to-Server Relay Bridges:** Interconnecting an unrestricted domestic Relay VPS with a blocked Exit VPS abroad where all standard TCP/UDP traffic is blocked. Throughput reaches 300-500 Mbps without packet drops.
+1. **Server-to-Server Relay Bridges:** Interconnecting an unrestricted domestic Relay VPS with a blocked Exit VPS abroad where standard TCP/UDP traffic is blocked, without packet drops.
 2. **Direct Client Access:** Connecting workstations or home routers possessing a dedicated public ("white") IPv4 address.
 
 ---

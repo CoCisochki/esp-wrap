@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
+	"encoding/binary"
 	"net"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestDirectionalKeysAndNoncesDifferent(t *testing.T) {
@@ -84,10 +86,11 @@ func TestHandshakeMac1AndDoSSafeguard(t *testing.T) {
 	copy(junkPkt, reqPkt)
 	junkPkt[len(junkPkt)-1] ^= 0xFF // corrupt HMAC
 
-	var lastNano int64
+	var lastClientNano int64
+	var lastArrivalNano int64
 	var rateMu sync.Mutex
 
-	_, _, err = UnpackHandshakeReq(junkPkt, mac1Key, &lastNano, &rateMu)
+	_, _, err = UnpackHandshakeReq(junkPkt, mac1Key, &lastClientNano, &lastArrivalNano, &rateMu)
 	if err == nil {
 		t.Fatalf("junk packet with invalid mac1 MUST be rejected")
 	}
@@ -95,7 +98,7 @@ func TestHandshakeMac1AndDoSSafeguard(t *testing.T) {
 		t.Fatalf("expected ErrMacValidation, got: %v", err)
 	}
 
-	pub, _, err := UnpackHandshakeReq(reqPkt, mac1Key, &lastNano, &rateMu)
+	pub, _, err := UnpackHandshakeReq(reqPkt, mac1Key, &lastClientNano, &lastArrivalNano, &rateMu)
 	if err != nil {
 		t.Fatalf("valid handshake req failed: %v", err)
 	}
@@ -104,9 +107,71 @@ func TestHandshakeMac1AndDoSSafeguard(t *testing.T) {
 	}
 
 	// Replay check
-	_, _, err = UnpackHandshakeReq(reqPkt, mac1Key, &lastNano, &rateMu)
+	_, _, err = UnpackHandshakeReq(reqPkt, mac1Key, &lastClientNano, &lastArrivalNano, &rateMu)
 	if err != ErrReplayDetected && err != ErrRateLimited {
 		t.Fatalf("replayed handshake req MUST be rejected, got: %v", err)
+	}
+}
+
+func TestHandshakeClockSkewTolerant(t *testing.T) {
+	curve := ecdh.X25519()
+	serverPriv, _ := curve.GenerateKey(rand.Reader)
+	clientPriv, _ := curve.GenerateKey(rand.Reader)
+
+	uuidStr := GenerateUUID()
+	uuidBytes, _ := ParseUUID(uuidStr)
+
+	serverPubBytes := serverPriv.PublicKey().Bytes()
+	authSPI := DeriveAuthSPI(serverPubBytes, uuidBytes)
+	mac1Key := DeriveMac1Key(serverPubBytes, uuidBytes)
+
+	// Simulate client whose clock is 30 seconds ahead of server clock
+	futureNano := time.Now().Add(30 * time.Second).UnixNano()
+	padLen := 16
+	totalLen := 45 + padLen + 16
+	buf := make([]byte, totalLen)
+	binary.BigEndian.PutUint32(buf[0:4], authSPI)
+	copy(buf[4:36], clientPriv.PublicKey().Bytes())
+	binary.BigEndian.PutUint64(buf[36:44], uint64(futureNano))
+	buf[44] = byte(padLen)
+	rand.Read(buf[45 : 45+padLen])
+	macTag := ComputeMac1(mac1Key, buf[:45+padLen])
+	copy(buf[45+padLen:totalLen], macTag[:])
+
+	var lastClientNano int64
+	var lastArrivalNano int64
+	var rateMu sync.Mutex
+
+	pub, _, err := UnpackHandshakeReq(buf, mac1Key, &lastClientNano, &lastArrivalNano, &rateMu)
+	if err != nil {
+		t.Fatalf("client with +30s clock skew should be accepted, got: %v", err)
+	}
+	if !bytes.Equal(pub, clientPriv.PublicKey().Bytes()) {
+		t.Fatalf("client ephemeral pub mismatch")
+	}
+
+	// Second packet from skewed client 2 seconds later (simulated):
+	// Even though client clock is ahead, arrival rate limiting uses server clock,
+	// so it should NOT be permanently banned.
+	// Rapid packet immediately should trigger rate limit based on server time:
+	futureNano2 := futureNano + int64(time.Second)
+	binary.BigEndian.PutUint64(buf[36:44], uint64(futureNano2))
+	macTag2 := ComputeMac1(mac1Key, buf[:45+padLen])
+	copy(buf[45+padLen:totalLen], macTag2[:])
+
+	_, _, err = UnpackHandshakeReq(buf, mac1Key, &lastClientNano, &lastArrivalNano, &rateMu)
+	if err != ErrRateLimited {
+		t.Fatalf("rapid packet in <1s must be rate limited by server clock, got: %v", err)
+	}
+
+	// Now simulate 1.5 seconds elapsed on server clock
+	lastArrivalNano -= int64(1500 * time.Millisecond)
+	pub2, _, err := UnpackHandshakeReq(buf, mac1Key, &lastClientNano, &lastArrivalNano, &rateMu)
+	if err != nil {
+		t.Fatalf("handshake after rate-limit period should succeed despite client clock skew, got: %v", err)
+	}
+	if !bytes.Equal(pub2, clientPriv.PublicKey().Bytes()) {
+		t.Fatalf("client ephemeral pub mismatch")
 	}
 }
 
@@ -127,9 +192,10 @@ func TestFullHandshakeAndDataTransmission(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var lastNano int64
+	var lastClientNano int64
+	var lastArrivalNano int64
 	var rateMu sync.Mutex
-	clientEphPubBytes, _, err := UnpackHandshakeReq(reqPkt, mac1Key, &lastNano, &rateMu)
+	clientEphPubBytes, _, err := UnpackHandshakeReq(reqPkt, mac1Key, &lastClientNano, &lastArrivalNano, &rateMu)
 	if err != nil {
 		t.Fatal(err)
 	}
